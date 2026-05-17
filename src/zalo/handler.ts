@@ -559,7 +559,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       // Determine media URL eagerly (before topic lookup) so download starts immediately
       const _eagerMediaUrl = (() => {
         if (msgType === ZALO_MSG_TYPES.VIDEO || msgType === ZALO_MSG_TYPES.VOICE ||
-            msgType === ZALO_MSG_TYPES.GIF   || msgType === ZALO_MSG_TYPES.FILE) return media.href;
+            msgType === ZALO_MSG_TYPES.GIF) return media.href;
+        if (msgType === ZALO_MSG_TYPES.FILE) return media.href || (media as any).url;
         if (msgType === ZALO_MSG_TYPES.PHOTO) {
           let u = media.href;
           try { const p = JSON.parse(media.params ?? '{}') as { hd?: string }; if (p.hd) u = p.hd; } catch {}
@@ -860,11 +861,11 @@ ${escapeHtml(photoCaption)}`
 
       // ── 4. File ────────────────────────────────────────────────────────────
       if (msgType === ZALO_MSG_TYPES.FILE) {
-        const url = media.href;
+        const url = media.href || (media as any).url;
         // title holds the original filename (e.g. "report.pdf")
         const fileName = media.title ?? `file_${Date.now()}`;
         if (!url) {
-          console.warn('[ZaloHandler] File: no URL found in content:', media);
+          console.warn('[ZaloHandler] File: no URL found in content:', JSON.stringify(media));
           return;
         }
         const localPath = await (earlyDlPromise ?? downloadToTemp(url, fileName));
@@ -876,7 +877,11 @@ ${escapeHtml(photoCaption)}`
             tgOpts,
           );
           saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+        } catch (err) {
+          console.error(`[ZaloHandler] Failed to send file "${fileName}" to Telegram:`, err);
+        } finally {
+          await cleanTemp(localPath);
+        }
         return;
       }
 

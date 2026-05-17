@@ -52,6 +52,7 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
 
     const filePath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
     try {
+      console.log(`[media] Downloading: ${url} -> ${filePath}`);
       const resp = await axios.get<NodeJS.ReadableStream>(url, {
         responseType: 'stream',
         timeout: 30_000,
@@ -62,7 +63,10 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
         const writer = createWriteStream(filePath);
         resp.data.pipe(writer);
         writer.on('finish', resolve);
-        writer.on('error', reject);
+        writer.on('error', (err) => {
+          console.error(`[media] Writer error for ${url}:`, err);
+          reject(err);
+        });
       });
 
       const { size } = await stat(filePath);
@@ -73,7 +77,8 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
       }
 
       return filePath;
-    } catch (err) {
+    } catch (err: any) {
+      console.error(`[media] Failed to download ${url}:`, err?.message || err);
       await unlink(filePath).catch(() => undefined);
       lastErr = err;
     }

@@ -1,7 +1,18 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'fs';
 import { gzipSync, gunzipSync } from 'zlib';
 import path from 'path';
 import { config } from './config.js';
+
+/**
+ * Track Zalo message IDs recently recalled from Telegram side.
+ * The undo event handler checks this to avoid sending duplicate
+ * "🗑 đã thu hồi" notifications for recalls we initiated ourselves.
+ */
+export const recentlyRecalledMsgIds = new Set<string>();
+export function markRecalled(msgId: string): void {
+  recentlyRecalledMsgIds.add(msgId);
+  setTimeout(() => recentlyRecalledMsgIds.delete(msgId), 5_000);
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -34,7 +45,9 @@ function load(): StoreData {
 
 function persist(data: StoreData): void {
   mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  const tmpPath = filePath + '.tmp';
+  writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+  renameSync(tmpPath, filePath);
 }
 
 function zaloKey(zaloId: string, type: 0 | 1): string {
@@ -93,6 +106,11 @@ export const store = {
   reload(): void {
     _data = load();
   },
+
+  stats(): { topics: number; sizeBytes: number } {
+    const raw = JSON.stringify(_data);
+    return { topics: Object.keys(_data.topics).length, sizeBytes: raw.length };
+  },
 };
 
 // ── Message ID mapping (in-memory, not persisted) ─────────────────────────────
@@ -115,7 +133,7 @@ export interface ZaloQuoteData {
   threadType: 0 | 1;
 }
 
-const MSG_CACHE_MAX = 2000;
+const MSG_CACHE_MAX = 10000;
 
 // ── Persistence helpers for msgStore ─────────────────────────────────────────
 //
@@ -228,7 +246,9 @@ function _scheduleMsgPersist(): void {
         q,
       };
       // gzip the JSON — reduces file size ~70% with zero new deps
-      writeFileSync(_msgMapFile, gzipSync(JSON.stringify(data), { level: 9 }));
+      const _tmpMsg = _msgMapFile + '.tmp';
+      writeFileSync(_tmpMsg, gzipSync(JSON.stringify(data), { level: 9 }));
+      renameSync(_tmpMsg, _msgMapFile);
     } catch (e) {
       console.warn('[msgStore] Failed to persist msg-map:', e);
     }
@@ -243,25 +263,40 @@ const _zaloToTg = new Map<string, number>();
 const _tgToQuote = new Map<number, ZaloQuoteData>();
 /** Insertion-order keys for eviction */
 const _msgKeyOrder: string[] = [];
+/** Số lượng zaloMsgId trỏ đến mỗi tgMsgId (để tránh xoá quote sớm) */
+const _tgRefCount = new Map<number, number>();
+
+function _evictOne(): void {
+  const old = _msgKeyOrder.shift();
+  if (!old) return;
+  const oldTg = _zaloToTg.get(old);
+  _zaloToTg.delete(old);
+  if (oldTg !== undefined) {
+    const remaining = (_tgRefCount.get(oldTg) ?? 1) - 1;
+    if (remaining <= 0) {
+      _tgRefCount.delete(oldTg);
+      _tgToQuote.delete(oldTg);
+    } else {
+      _tgRefCount.set(oldTg, remaining);
+    }
+  }
+}
 
 // Load persisted data immediately
 {
   const saved = _loadMsgMap();
   for (const [zaloId, tgId] of saved.pairs) {
+    if (!_zaloToTg.has(zaloId)) {
+      _msgKeyOrder.push(zaloId);
+      _tgRefCount.set(tgId, (_tgRefCount.get(tgId) ?? 0) + 1);
+    }
     _zaloToTg.set(zaloId, tgId);
-    _msgKeyOrder.push(zaloId);
   }
   for (const [tgId, quote] of saved.quotes) {
     _tgToQuote.set(tgId, quote);
   }
   // Trim if over limit (file may have grown beyond MSG_CACHE_MAX)
-  while (_msgKeyOrder.length > MSG_CACHE_MAX) {
-    const old = _msgKeyOrder.shift();
-    if (!old) break;
-    const oldTg = _zaloToTg.get(old);
-    _zaloToTg.delete(old);
-    if (oldTg !== undefined) _tgToQuote.delete(oldTg);
-  }
+  while (_msgKeyOrder.length > MSG_CACHE_MAX) _evictOne();
 }
 
 export const msgStore = {
@@ -275,16 +310,13 @@ export const msgStore = {
     // Drop sentinel "0" and empty IDs — they are realMsgId=0 placeholders,
     // nobody ever queries getTgMsgId("0") so storing them is pure waste.
     const validIds = zaloMsgIds.filter(id => id && id !== '0');
-    while (_msgKeyOrder.length + validIds.length > MSG_CACHE_MAX) {
-      const old = _msgKeyOrder.shift();
-      if (!old) break;
-      const oldTg = _zaloToTg.get(old);
-      _zaloToTg.delete(old);
-      if (oldTg !== undefined) _tgToQuote.delete(oldTg);
-    }
+    while (_msgKeyOrder.length + validIds.length > MSG_CACHE_MAX) _evictOne();
     for (const id of validIds) {
+      if (!_zaloToTg.has(id)) {
+        _tgRefCount.set(tgMsgId, (_tgRefCount.get(tgMsgId) ?? 0) + 1);
+        _msgKeyOrder.push(id);
+      }
       _zaloToTg.set(id, tgMsgId);
-      _msgKeyOrder.push(id);
     }
     _tgToQuote.set(tgMsgId, quote);
     _scheduleMsgPersist();
@@ -298,6 +330,22 @@ export const msgStore = {
   /** Get the Zalo quote data for a given Telegram message_id (for TG→Zalo replies). */
   getQuote(tgMsgId: number): ZaloQuoteData | undefined {
     return _tgToQuote.get(tgMsgId);
+  },
+
+  /**
+   * Update the cliMsgId on an existing quote entry.
+   * Used when the Zalo echo event provides the real cliMsgId after a TG→Zalo send.
+   */
+  updateQuoteCliMsgId(tgMsgId: number, cliMsgId: string): void {
+    const quote = _tgToQuote.get(tgMsgId);
+    if (quote) {
+      quote.cliMsgId = cliMsgId;
+      _scheduleMsgPersist();
+    }
+  },
+
+  stats(): { cacheSize: number; keyOrderLen: number; quoteCount: number } {
+    return { cacheSize: _zaloToTg.size, keyOrderLen: _msgKeyOrder.length, quoteCount: _tgToQuote.size };
   },
 };
 
@@ -383,7 +431,9 @@ function _scheduleUserCachePersist(): void {
         for (const [norm, uid] of m) obj[norm] = uid;
         disk.g[gid] = obj;
       }
-      writeFileSync(_userCacheFile, gzipSync(JSON.stringify(disk), { level: 9 }));
+      const _tmpUser = _userCacheFile + '.tmp';
+      writeFileSync(_tmpUser, gzipSync(JSON.stringify(disk), { level: 9 }));
+      renameSync(_tmpUser, _userCacheFile);
     } catch (e) {
       console.warn('[userCache] Failed to persist:', e);
     }
@@ -405,6 +455,12 @@ export const userCache = {
         const oldName = _uidToName.get(firstUid);
         _uidToName.delete(firstUid);
         if (oldName) _normToUid.delete(_normName(oldName));
+        // Xoá luôn trong _groupNameToUid để tránh rò rỉ
+        for (const [, nameMap] of _groupNameToUid) {
+          for (const [norm, uid2] of nameMap) {
+            if (uid2 === firstUid) { nameMap.delete(norm); break; }
+          }
+        }
       }
     }
     _uidToName.set(uid, displayName);
@@ -435,6 +491,10 @@ export const userCache = {
   /** Get display name for a UID. */
   getName(uid: string): string | undefined {
     return _uidToName.get(uid);
+  },
+
+  stats(): { users: number; groups: number } {
+    return { users: _uidToName.size, groups: _groupNameToUid.size };
   },
 };
 
@@ -528,7 +588,7 @@ export const friendsCache = {
     const q = query.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
     return _friends
       .filter(f => {
-        const searchName = (f.alias || f.displayName).toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
+        const searchName = (f.alias || f.displayName || '').toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
         const realName   = f.displayName.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
         return searchName.includes(q) || realName.includes(q);
       })
@@ -542,6 +602,10 @@ export const friendsCache = {
 
   get(userId: string): ZaloFriend | undefined {
     return _friends.find(f => f.userId === userId);
+  },
+
+  stats(): { count: number } {
+    return { count: _friends.length };
   },
 };
 
@@ -576,13 +640,18 @@ export const groupsCache = {
   isFresh(): boolean {
     return _groups.length > 0 && Date.now() - _groupsTs < GROUPS_TTL_MS;
   },
+
+  stats(): { count: number } {
+    return { count: _groups.length };
+  },
 };
 
 // ── Sent message store (TG→Zalo direction) ────────────────────────────────────
 
 export interface SentMsgInfo {
-  /** Zalo msgId returned by api.sendMessage / api.sendVoice */
-  msgId:      string | number;
+  /** Zalo msgId(s) returned by api.sendMessage / api.sendVoice.
+   *  Có thể nhiều msgId khi gửi album (mỗi file là một tin Zalo riêng). */
+  msgIds:     (string | number)[];
   /** Zalo conversation ID */
   zaloId:     string;
   /** 0 = DM, 1 = Group */
@@ -592,14 +661,34 @@ export interface SentMsgInfo {
 const _sentMap      = new Map<number, SentMsgInfo>(); // tgMsgId → info
 const _sentByZaloId = new Map<string, number>();       // String(zaloMsgId) → tgMsgId
 
+/** Insertion-order tracking for sentMap eviction (oldest first) */
+const _sentKeyOrder: number[] = [];
+const SENT_MAP_MAX = 5000;
+
 /** zaloId values currently being sent by the bot (to handle echo race condition) */
 const _pendingSendConvos = new Map<string, number>(); // zaloId → timestamp
 
 export const sentMsgStore = {
   /** Record a message we sent from TG→Zalo. tgMsgId is the user's TG message. */
   save(tgMsgId: number, info: SentMsgInfo): void {
+    // Evict oldest entry if at capacity (only count NEW tgMsgIds)
+    if (!_sentMap.has(tgMsgId)) {
+      _sentKeyOrder.push(tgMsgId);
+      while (_sentKeyOrder.length > SENT_MAP_MAX) {
+        const oldest = _sentKeyOrder.shift()!;
+        const oldInfo = _sentMap.get(oldest);
+        _sentMap.delete(oldest);
+        if (oldInfo) {
+          for (const mid of oldInfo.msgIds) {
+            _sentByZaloId.delete(String(mid));
+          }
+        }
+      }
+    }
     _sentMap.set(tgMsgId, info);
-    _sentByZaloId.set(String(info.msgId), tgMsgId);
+    for (const mid of info.msgIds) {
+      _sentByZaloId.set(String(mid), tgMsgId);
+    }
   },
 
   get(tgMsgId: number): SentMsgInfo | undefined {
@@ -630,12 +719,20 @@ export const sentMsgStore = {
   },
 
   /**
-   * Returns true if the bot is currently sending (or just finished sending within
-   * 3 s) to this zaloId — used to suppress isSelf echo in the Zalo listener.
+   * Returns true if the bot is currently sending to this zaloId.
+   * Used to suppress isSelf echo in the Zalo listener.
+   * The echo handler in zalo/handler.ts now skips all isSelf messages
+   * unconditionally, so the primary echo suppression no longer depends
+   * on this window. Reduced from 15s to 5s to minimise false suppression
+   * of genuine messages arriving from other devices.
    */
   isSendingTo(zaloId: string): boolean {
     const ts = _pendingSendConvos.get(zaloId);
-    return ts !== undefined && Date.now() - ts < 3000;
+    return ts !== undefined && Date.now() - ts < 5_000;
+  },
+
+  stats(): { entries: number } {
+    return { entries: _sentMap.size };
   },
 };
 
@@ -654,6 +751,14 @@ const _reactionSummaries = new Map<number, ReactionSummaryEntry>(); // tgMsgId �
 export const reactionSummaryStore = {
   /** Add or update a reaction. Returns the entry for this tgMsgId. */
   upsert(tgMsgId: number, emoji: string, actorName: string): ReactionSummaryEntry {
+    if (_reactionSummaries.size >= 500) {
+      const toDelete: number[] = [];
+      for (const [id, e] of _reactionSummaries) {
+        if (e.debounceTimer === null && e.summaryTgMsgId !== null) toDelete.push(id);
+        if (toDelete.length >= 250) break;
+      }
+      for (const id of toDelete) _reactionSummaries.delete(id);
+    }
     let entry = _reactionSummaries.get(tgMsgId);
     if (!entry) {
       entry = { summaryTgMsgId: null, lastSentText: '', reactions: {}, debounceTimer: null };
@@ -669,6 +774,10 @@ export const reactionSummaryStore = {
   setSummaryMsgId(tgMsgId: number, summaryMsgId: number): void {
     const entry = _reactionSummaries.get(tgMsgId);
     if (entry) entry.summaryTgMsgId = summaryMsgId;
+  },
+
+  stats(): { entries: number } {
+    return { entries: _reactionSummaries.size };
   },
 
   buildText(entry: ReactionSummaryEntry): string {
@@ -736,6 +845,7 @@ export interface MediaGroupItem {
   fileSize?: number;
   caption?:  string;
   captionMentions?: Array<{ pos: number; uid: string; len: number }>;
+  tgMsgId?:  number;
 }
 
 interface MediaGroupBuffer {
@@ -800,7 +910,18 @@ export const zaloAlbumStore = {
     msgIds: string[],
     meta: Omit<ZaloAlbumBuffer, 'timer' | 'urls' | 'zaloMsgIds'>,
     onFlush: (buf: Omit<ZaloAlbumBuffer, 'timer'>) => void,
+    childnumber = 0,
   ): void {
+    // If a new album (childnumber==0) arrives while a buffer exists for
+    // the same key, flush the old buffer immediately to prevent album merging.
+    if (childnumber === 0) {
+      const existing = _zaloAlbumBuffers.get(key);
+      if (existing) {
+        clearTimeout(existing.timer);
+        _zaloAlbumBuffers.delete(key);
+        setImmediate(() => onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta }));
+      }
+    }
     const existing = _zaloAlbumBuffers.get(key);
     if (existing) {
       clearTimeout(existing.timer);
@@ -825,7 +946,7 @@ export const zaloAlbumStore = {
   },
 };
 
-// ── Poll store (Zalo ↔ TG native poll) ───────────────────────────────────────
+// ── Poll store (Zalo ↔ TG native poll, persisted to disk) ─────────────────────
 
 export interface PollEntry {
   pollId:           number;
@@ -841,15 +962,55 @@ export interface PollEntry {
   }[];
 }
 
+const _pollFile = path.resolve(config.dataDir, 'polls.json.gz');
+
+function _loadPolls(): void {
+  if (!existsSync(_pollFile)) return;
+  try {
+    const buf = readFileSync(_pollFile);
+    const raw = JSON.parse(gunzipSync(buf).toString('utf8')) as { entries: PollEntry[] };
+    for (const entry of raw.entries ?? []) {
+      _pollByZaloId.set(entry.pollId, entry);
+      _pollByTgId.set(entry.tgPollMsgId, entry);
+      _pollByUUID.set(entry.tgPollUUID, entry);
+    }
+    console.log(`[pollStore] Loaded ${raw.entries.length} polls from disk`);
+  } catch (e) {
+    console.warn('[pollStore] Failed to load polls:', e);
+  }
+}
+
+let _pollPersistTimer: ReturnType<typeof setTimeout> | null = null;
+function _schedulePollPersist(): void {
+  if (_pollPersistTimer) return;
+  _pollPersistTimer = setTimeout(() => {
+    _pollPersistTimer = null;
+    try {
+      mkdirSync(path.dirname(_pollFile), { recursive: true });
+      const entries: PollEntry[] = [];
+      for (const e of _pollByZaloId.values()) entries.push(e);
+      const tmp = _pollFile + '.tmp';
+      writeFileSync(tmp, gzipSync(JSON.stringify({ entries }), { level: 9 }));
+      renameSync(tmp, _pollFile);
+    } catch (e) {
+      console.warn('[pollStore] Failed to persist:', e);
+    }
+  }, 1500);
+}
+
 const _pollByZaloId = new Map<number, PollEntry>();       // pollId → entry
 const _pollByTgId   = new Map<number, PollEntry>();       // tgPollMsgId → entry
 const _pollByUUID   = new Map<string, PollEntry>();       // tgPollUUID → entry
+
+// Load persisted polls on startup
+_loadPolls();
 
 export const pollStore = {
   save(entry: PollEntry): void {
     _pollByZaloId.set(entry.pollId, entry);
     _pollByTgId.set(entry.tgPollMsgId, entry);
     _pollByUUID.set(entry.tgPollUUID, entry);
+    _schedulePollPersist();
   },
 
   getByPollId(pollId: number): PollEntry | undefined {
@@ -867,6 +1028,9 @@ export const pollStore = {
   /** Update tgScoreMsgId after editing */
   updateScoreMsg(pollId: number, newMsgId: number): void {
     const e = _pollByZaloId.get(pollId);
-    if (e) e.tgScoreMsgId = newMsgId;
+    if (e) {
+      e.tgScoreMsgId = newMsgId;
+      _schedulePollPersist();
+    }
   },
 };

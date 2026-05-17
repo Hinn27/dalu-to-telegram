@@ -106,6 +106,7 @@ async function main(): Promise<void> {
     { command: 'friendrequests', description: 'Xem lời mời kết bạn & lời mời nhóm' },
     { command: 'topic',          description: 'Quản lý topic: list / info / delete' },
     { command: 'recall',         description: 'Thu hồi tin nhắn (reply vào tin đã gửi)' },
+    { command: 'admin',          description: 'Admin panel: trạng thái, cache, tra mapping' },
     { command: 'status',         description: 'Xem trạng thái bridge: uptime, số topic, Zalo' },
   ]).catch(() => undefined);
 
@@ -142,10 +143,12 @@ async function main(): Promise<void> {
   console.log('[Boot] Bridge is running 🚀  (Ctrl+C to stop)');
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     console.log(`\n[Boot] Received ${signal}, shutting down...`);
-    try { getZaloApi().then(api => api.listener.stop()).catch(() => undefined); } catch { /* ignore */ }
-    tgBot.stop(signal);
+    try { const api = await getZaloApi(); api.listener.stop(); } catch { /* ignore */ }
+    await tgBot.stop(signal);
+    // Wait for debounced persistence (msgStore 1000ms, userCache 2000ms) to flush
+    await new Promise(r => setTimeout(r, 2500));
     process.exit(0);
   };
 

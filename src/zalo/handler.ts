@@ -12,7 +12,7 @@ import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyZaloMarkupHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import type { ZaloStyle } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, aliasCache, friendsCache, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, aliasCache, friendsCache, recentlyRecalledMsgIds, type ZaloQuoteData } from '../store.js';
 import { tgQueue } from '../utils/tgQueue.js';
 
 // Proxy that routes every tg.* call through the rate-limit queue
@@ -497,20 +497,25 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
 
   api.listener.on('message', async (msg: ZaloMessage) => {
     try {
-      // Skip messages sent by the bot (TG→Zalo echo) but NOT messages
-      // the user sends directly from the Zalo app.
-      // We check both sentMsgStore (post-save) and isSendingTo (race window).
+      // Skip TG→Zalo echo (re-emitted by Zalo server) but forward
+      // real self messages sent directly from the Zalo app.
       if (msg.isSelf) {
-        const selfMsgIds = [msg.data.msgId, msg.data.realMsgId]
-          .filter((id): id is string => typeof id === 'string' && id.length > 0);
-        const isEcho =
-          selfMsgIds.some(id => sentMsgStore.getByZaloMsgId(id) !== undefined)
+        // Update cliMsgId from echo for future quote chains
+        if (msg.data.cliMsgId) {
+          const _tgId = msgStore.getTgMsgId(msg.data.msgId);
+          if (_tgId !== undefined) {
+            msgStore.updateQuoteCliMsgId(_tgId, msg.data.cliMsgId);
+          }
+        }
+        // If this msgId is already tracked in sentMsgStore OR we're in the
+        // middle of sending to this Zalo thread → it's an echo, skip.
+        const isEcho = sentMsgStore.getByZaloMsgId(msg.data.msgId) !== undefined
           || sentMsgStore.isSendingTo(msg.threadId);
         if (isEcho) {
-          console.log(`[Zalo→TG] Skip bot echo (${selfMsgIds.join(', ')})`);
+          console.log(`[Zalo→TG] Skip echo self message (${msg.data.msgId})`);
           return;
         }
-        // isSelf but NOT a bot echo → user sent from Zalo app, forward to TG
+        // Real self message from Zalo app — fall through and forward to Telegram
       }
 
       // Skip duplicate deliveries — Zalo re-emits the same message event when
@@ -530,8 +535,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
 
       const zaloId     = msg.threadId;
       const type       = msg.type as 0 | 1;
-      const ownUid     = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : undefined;
-      const senderUid  = msg.isSelf && ownUid ? ownUid : msg.data.uidFrom;
+      const ownUid     = String(api.getOwnId?.() ?? '');
+      const senderUid  = msg.isSelf && ownUid ? ownUid : (msg.data.uidFrom ?? '');
       const senderName = msg.isSelf ? 'Bạn' : (msg.data.dName ?? msg.data.uidFrom);
       const msgType    = msg.data.msgType ?? ZALO_MSG_TYPES.TEXT;
 
@@ -544,13 +549,6 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       if (type === 1 && !_memberCacheLoaded.has(zaloId)) {
         _memberCacheLoaded.add(zaloId);
         void populateGroupMemberCache(api, zaloId);
-      }
-
-      // Keep userCache up-to-date so TG→Zalo mention resolution works
-      if (type === ThreadType.Group) {
-        userCache.saveForGroup(senderUid, senderName, zaloId);
-      } else {
-        userCache.save(senderUid, senderName);
       }
 
       // Parse content early so we can start media download in parallel with topic resolution
@@ -580,19 +578,31 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       //   - Group: use group name from getGroupInfo for topic, but use the sender's
       //     contact-book name in message captions/headers when available.
       //   - DM: use the PEER's contact-book name (zaloId = peer UID), not the raw sender dName.
+      // NOTE: We do NOT pass `senderName` (msg.data.dName) as fallback to
+      // resolveUserDisplayName because Zalo's dName field is unreliable — it can
+      // contain filenames or metadata (e.g. "My Documents") instead of the sender's
+      // real name. The default fallback chain (UID → 'ai đó') is safer.
       let displayName = senderName;
-      let bridgeSenderName = msg.isSelf ? senderName : await resolveUserDisplayName(api, senderUid, senderName);
+      let bridgeSenderName = msg.isSelf ? senderName : await resolveUserDisplayName(api, senderUid);
       let groupAvatarUrl: string | undefined;
       if (type === ThreadType.Group) {
         const info = await getCachedGroupInfo(api, zaloId);
         displayName = info.name || senderName;
         groupAvatarUrl = info.avt;
       } else {
-        // For DMs, zaloId is the peer's UID — resolve their real name then apply alias/contact name.
-        // Use the same contact-book name both for the topic and the message caption/header.
-        const realName = await resolveUserDisplayName(api, zaloId, senderName);
+        // For DMs, zaloId is the peer's UID — resolve their real name for the topic name.
+        // bridgeSenderName is already set correctly above (sender's name, or 'Bạn' if isSelf).
+        const realName = await resolveUserDisplayName(api, zaloId);
         displayName = realName;
-        bridgeSenderName = displayName;
+      }
+
+      // Keep userCache up-to-date so TG→Zalo mention resolution works.
+      // Use the resolved bridgeSenderName rather than the raw senderName (dName)
+      // to avoid caching metadata-like values (e.g. "My Documents").
+      if (type === ThreadType.Group && senderUid) {
+        userCache.saveForGroup(senderUid, bridgeSenderName, zaloId);
+      } else if (senderUid) {
+        userCache.save(senderUid, bridgeSenderName);
       }
 
       const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
@@ -600,26 +610,36 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       // Resolve Telegram reply target from incoming Zalo quote (if any)
       let tgReplyMsgId: number | undefined;
       if (msg.data.quote) {
-        const globalId = String(msg.data.quote.globalMsgId);
-        // Primary: messages received from Zalo and forwarded to TG.
-        // IMPORTANT: Zalo globalMsgId is NOT unique across groups — validate the found
-        // mapping belongs to the same thread to avoid quoting a message from a different group.
-        const _candidateTg = msgStore.getTgMsgId(globalId);
-        if (_candidateTg !== undefined) {
-          const _quoteData = msgStore.getQuote(_candidateTg);
-          if (!_quoteData || _quoteData.zaloId === zaloId) {
-            tgReplyMsgId = _candidateTg;
-          } else {
-            console.warn(`[Zalo→TG] Quote globalMsgId=${globalId} maps to thread ${_quoteData.zaloId} but current thread is ${zaloId} — ignoring stale cross-group mapping`);
+        // Zalo sets globalMsgId=0 for DMs — fall back to cliMsgId in that case.
+        // Build a list of candidate IDs to try in order.
+        const _candidateIds: string[] = [];
+        const _g = msg.data.quote.globalMsgId;
+        const _c = msg.data.quote.cliMsgId;
+        if (_g && _g !== 0) _candidateIds.push(String(_g));
+        if (_c && _c !== 0) _candidateIds.push(String(_c));
+
+        for (const globalId of _candidateIds) {
+          if (tgReplyMsgId !== undefined) break;
+          // Primary: messages received from Zalo and forwarded to TG.
+          // IMPORTANT: Zalo globalMsgId is NOT unique across groups — validate the found
+          // mapping belongs to the same thread to avoid quoting a message from a different group.
+          const _candidateTg = msgStore.getTgMsgId(globalId);
+          if (_candidateTg !== undefined) {
+            const _quoteData = msgStore.getQuote(_candidateTg);
+            if (!_quoteData || _quoteData.zaloId === zaloId) {
+              tgReplyMsgId = _candidateTg;
+              break;
+            } else {
+              console.warn(`[Zalo→TG] Quote msgId=${globalId} maps to thread ${_quoteData.zaloId} but current thread is ${zaloId} — ignoring stale cross-group mapping`);
+            }
           }
-        }
-        // Fallback: messages we sent from TG to Zalo (reverse lookup), also validate thread
-        if (tgReplyMsgId === undefined) {
+          // Fallback: messages we sent from TG to Zalo (reverse lookup), also validate thread
           const _sentTg = sentMsgStore.getByZaloMsgId(globalId);
           if (_sentTg !== undefined) {
             const _sentInfo = sentMsgStore.get(_sentTg);
             if (!_sentInfo || _sentInfo.zaloId === zaloId) {
               tgReplyMsgId = _sentTg;
+              break;
             }
           }
         }
@@ -745,8 +765,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         const albumKey = `${zaloId}:${senderUid}`;
 
         // If childnumber > 0 OR there's already a buffer for this key → album mode
-        const hasBuffer = (typeof zaloAlbumStore as unknown as { _has?: (k: string) => boolean })._has?.(albumKey);
-        void hasBuffer; // unused, we detect via the add callback
+        // (detected via the add callback which reuses or creates the buffer)
 
         zaloAlbumStore.add(
           albumKey,
@@ -794,7 +813,6 @@ ${escapeHtml(photoCaption)}`
                   : groupCaption(buf.senderName);
                 // Telegram limits media groups to 10 items — split into batches
                 const BATCH = 10;
-                let firstSaved = false;
                 for (let i = 0; i < localPaths.length; i += BATCH) {
                   const batch = localPaths.slice(i, i + BATCH);
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -808,11 +826,10 @@ ${escapeHtml(photoCaption)}`
                     mediaItems,
                     { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
                   );
-                  // Save mapping for the very first photo (for reply chain)
-                  if (!firstSaved && sentMsgs.length > 0) {
-                    firstSaved = true;
-                    // Use buf.zaloQuote (correct cliMsgId + parsed media object)
-                    msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, buf.zaloQuote!);
+                  // Save mapping for every photo so replying to ANY album photo
+                  // produces a valid Zalo quote
+                  for (const sentMsg of sentMsgs) {
+                    msgStore.save(sentMsg.message_id, buf.zaloMsgIds, buf.zaloQuote!);
                   }
                 }
               } finally {
@@ -820,6 +837,7 @@ ${escapeHtml(photoCaption)}`
               }
             }
           },
+          childnumber,
         );
 
         return;
@@ -1263,7 +1281,8 @@ ${escapeHtml(photoCaption)}`
               const resp = await api.getUserInfo(uid) as {
                 changed_profiles?: Record<string, { displayName?: string }>;
               };
-              contactName = resp?.changed_profiles?.[uid]?.displayName ?? uid;
+              const uidKey = uid.includes('_') ? uid : `${uid}_0`;
+              contactName = resp?.changed_profiles?.[uidKey]?.displayName ?? uid;
               if (contactName !== uid) userCache.save(uid, contactName);
             } catch { /* non-fatal */ }
           }
@@ -1460,6 +1479,12 @@ ${escapeHtml(photoCaption)}`
       const zaloMsgId = rawMsgId;
       if (!zaloMsgId) {
         console.log(`[ZaloHandler] Undo: could not resolve msgId, raw undo data:`, JSON.stringify(data));
+        return;
+      }
+
+      // Skip notification if we just initiated this recall from Telegram (prevents duplicate "🗑" message)
+      if (recentlyRecalledMsgIds.has(zaloMsgId)) {
+        console.log(`[ZaloHandler] Undo: skip notification for recently-recalled msgId=${zaloMsgId}`);
         return;
       }
 

@@ -3,7 +3,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-/** Root của project (src/../) */
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 function requireEnv(key: string): string {
@@ -38,6 +37,10 @@ export const config = {
   zalo: {
     credentialsPath: resolvePath(process.env.ZALO_CREDENTIALS_PATH, 'credentials.json'),
     skipMutedGroups: envFlag('ZALO_SKIP_MUTED_GROUPS'),
+    // Mirror Zalo's "mute notifications" → deliver those threads silently on
+    // Telegram (messages still arrive, just no ping). On by default; set
+    // ZALO_MUTE_SILENT=0 to always notify.
+    muteSilentMirror: envFlag('ZALO_MUTE_SILENT', true),
   },
   dataDir: resolvePath(process.env.DATA_DIR, 'data'),
 } as const;

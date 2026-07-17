@@ -33,7 +33,10 @@ const BOT_COMMANDS = [
 /** Singleton Telegraf bot instance shared across the app. */
 export const tgBot = new Telegraf(config.telegram.token, {
   telegram: config.telegram.localServer
-    ? { apiRoot: config.telegram.localServer, agent: localAgent }
+    ? {
+        apiRoot: config.telegram.localServer,
+        agent: config.telegram.localServer.startsWith('https') ? agent : localAgent,
+      }
     : { agent },
 });
 

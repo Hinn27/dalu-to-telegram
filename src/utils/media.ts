@@ -80,7 +80,8 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
     try {
       const resp = await axios.get<NodeJS.ReadableStream>(url, {
         responseType: 'stream',
-        timeout: 30_000,
+        timeout: 15_000, // 15 s per attempt; downloadToTemp retries 3x on failure,
+                         // so total wait is bounded to roughly 15s×3 + backoff
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
       });
 
@@ -138,6 +139,39 @@ export async function downloadToTempFromCandidates(
 /** Remove a temp file, ignoring errors. */
 export async function cleanTemp(filePath: string): Promise<void> {
   try { await unlink(filePath); } catch { /* ignore */ }
+}
+
+/**
+ * Run an array of async tasks with a bounded concurrency limit.
+ *
+ * Firing all tasks at once (Promise.allSettled(tasks.map(...))) saturates the
+ * OS TCP connection pool when the array is large (e.g. an 18-photo album),
+ * causing ETIMEDOUT on later requests even though the server is reachable.
+ *
+ * Returns the same shape as Promise.allSettled so callers can skip
+ * individual failed items without aborting the whole batch.
+ */
+export async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  concurrency = 4,
+): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+  let next = 0;
+
+  async function worker(): Promise<void> {
+    while (next < tasks.length) {
+      const idx = next++;
+      try {
+        results[idx] = { status: 'fulfilled', value: await tasks[idx]!() };
+      } catch (err) {
+        results[idx] = { status: 'rejected', reason: err };
+      }
+    }
+  }
+
+  // Launch `concurrency` parallel workers; each pulls the next task until done
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+  return results;
 }
 
 /** Split Telegram album payloads without ever producing an invalid >10 batch. */

@@ -1078,10 +1078,20 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
             if (buf.items.length === 1) {
               // Single photo
               const item = buf.items[0]!;
-              const localPath = await downloadToTempFromCandidates(
-                [item.url, ...item.fallbackUrls],
-                `photo_${Date.now()}.jpg`,
-              );
+              let localPath: string;
+              try {
+                localPath = await downloadToTempFromCandidates(
+                  [item.url, ...item.fallbackUrls],
+                  `photo_${Date.now()}.jpg`,
+                );
+              } catch (dlErr) {
+                console.warn('[ZaloHandler] Photo download failed after retries:', dlErr);
+                await tg.sendMessage(config.telegram.groupId,
+                  `${groupCaption(buf.senderName)}\n⚠️ <i>Không thể tải ảnh từ Zalo (lỗi mạng). Vui lòng yêu cầu gửi lại.</i>`,
+                  { ...buf.tgBase, parse_mode: 'HTML' })
+                  .catch(notifyErr => console.error('[ZaloHandler] Failed to send photo-download-failure notice:', notifyErr));
+                return;
+              }
               try {
                 const sent = await withLocalMediaFallback(
                   forceMultipart => tg.sendPhoto(
@@ -1119,7 +1129,14 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
                   console.warn('[ZaloHandler] Album: skipping failed photo download:', r.reason);
                   return [];
                 });
-                if (downloaded.length === 0) return;
+                if (downloaded.length === 0) {
+                  console.warn(`[ZaloHandler] Album: all ${buf.items.length} photo download(s) failed — notifying user`);
+                  await tg.sendMessage(config.telegram.groupId,
+                    `${groupCaption(buf.senderName)}\n⚠️ <i>Không thể tải ${buf.items.length} ảnh từ Zalo (lỗi mạng). Vui lòng yêu cầu gửi lại.</i>`,
+                    { ...buf.tgBase, parse_mode: 'HTML' })
+                    .catch(notifyErr => console.error('[ZaloHandler] Failed to send album-download-failure notice:', notifyErr));
+                  return;
+                }
                 localPaths.push(...downloaded.map(d => d.localPath));
                 const captionText = buf.caption
                   ? `${groupCaption(buf.senderName)}\n${escapeHtml(buf.caption)}`
@@ -1217,7 +1234,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           console.warn('[ZaloHandler] GIF download failed after retries:', dlErr);
           await tg.sendMessage(config.telegram.groupId,
             `${caption}\n⚠️ <i>Không thể tải GIF từ Zalo (lỗi mạng). Vui lòng yêu cầu gửi lại.</i>`,
-            { ...tgBase, parse_mode: 'HTML' }).catch(() => undefined);
+            { ...tgBase, parse_mode: 'HTML' })
+            .catch(notifyErr => console.error('[ZaloHandler] Failed to send GIF-download-failure notice:', notifyErr));
           return;
         }
         try {
@@ -1248,7 +1266,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           console.warn(`[ZaloHandler] File download failed after retries: ${fileName}`, dlErr);
           await tg.sendMessage(config.telegram.groupId,
             `${caption}\n⚠️ <i>Không thể tải file <b>${escapeHtml(fileName)}</b> từ Zalo (lỗi mạng). Vui lòng yêu cầu gửi lại.</i>`,
-            { ...tgBase, parse_mode: 'HTML' }).catch(() => undefined);
+            { ...tgBase, parse_mode: 'HTML' })
+            .catch(notifyErr => console.error('[ZaloHandler] Failed to send file-download-failure notice:', notifyErr));
           return;
         }
         const stream = createReadStream(localPath);
@@ -1274,7 +1293,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           console.warn('[ZaloHandler] Video download failed after retries:', dlErr);
           await tg.sendMessage(config.telegram.groupId,
             `${caption}\n⚠️ <i>Không thể tải video từ Zalo (lỗi mạng). Vui lòng yêu cầu gửi lại.</i>`,
-            { ...tgBase, parse_mode: 'HTML' }).catch(() => undefined);
+            { ...tgBase, parse_mode: 'HTML' })
+            .catch(notifyErr => console.error('[ZaloHandler] Failed to send video-download-failure notice:', notifyErr));
           return;
         }
         const stream = createReadStream(localPath);
@@ -1297,7 +1317,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           console.warn('[ZaloHandler] Voice download failed after retries:', dlErr);
           await tg.sendMessage(config.telegram.groupId,
             `${caption}\n⚠️ <i>Không thể tải tin nhắn thoại từ Zalo (lỗi mạng). Vui lòng yêu cầu gửi lại.</i>`,
-            { ...tgBase, parse_mode: 'HTML' }).catch(() => undefined);
+            { ...tgBase, parse_mode: 'HTML' })
+            .catch(notifyErr => console.error('[ZaloHandler] Failed to send voice-download-failure notice:', notifyErr));
           return;
         }
         const stream = createReadStream(localPath);
@@ -1913,7 +1934,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         if (staleTopicId !== undefined) {
           await tg.sendMessage(config.telegram.groupId,
             '⚠️ <i>Không thể tải media từ Zalo (lỗi mạng tạm thời). Vui lòng yêu cầu người gửi chia sẻ lại.</i>',
-            { message_thread_id: staleTopicId, parse_mode: 'HTML' }).catch(() => undefined);
+            { message_thread_id: staleTopicId, parse_mode: 'HTML' })
+            .catch(notifyErr => console.error('[ZaloHandler] Failed to send media-download-failure notice:', notifyErr));
         }
       } else {
         console.error('[ZaloHandler] Error:', err);

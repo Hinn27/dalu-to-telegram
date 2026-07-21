@@ -83,6 +83,15 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
         timeout: 15_000, // 15 s per attempt; downloadToTemp retries 3x on failure,
                          // so total wait is bounded to roughly 15s×3 + backoff
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
+        // Force IPv4-only DNS resolution/connect. Node's Happy Eyeballs
+        // (RFC 8305, default since Node 18) tries IPv6 candidates first; in
+        // many Docker setups the container has no working IPv6 route, so
+        // every request stalls through the full IPv6 connect-attempt timeout
+        // before falling back to IPv4 — surfacing as
+        // `AggregateError [ETIMEDOUT]` at `internalConnectMultiple`. Zalo's
+        // CDN (zdn.vn / dlfl.vn / flchat.vn) is IPv4-only in practice, so
+        // skipping the IPv6 attempt entirely removes this stall.
+        family: 4,
       });
 
       await new Promise<void>((resolve, reject) => {

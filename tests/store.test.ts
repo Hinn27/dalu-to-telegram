@@ -18,6 +18,7 @@ const {
   reactionEchoStore,
   reactionEventDedupeStore,
   reactionSummaryStore,
+  recallNotifiedStore,
   sentMsgStore,
   store,
   userCache,
@@ -197,6 +198,15 @@ test('reactionEventDedupeStore normalizes target order and actor names', () => {
   });
   assert.equal(first, false);
   assert.equal(second, true);
+});
+
+test('recallNotifiedStore suppresses duplicate recall notifications and allows re-mark after unmark', () => {
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), true);
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), false);
+  assert.equal(recallNotifiedStore.markIfFirst('recall-2'), true);
+  recallNotifiedStore.unmark('recall-1');
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), true);
+  assert.equal(recallNotifiedStore.markIfFirst('recall-1'), false);
 });
 
 test('reactionSummaryStore does not duplicate the same actor per emoji', () => {

@@ -103,6 +103,8 @@ Copy [.env.example](.env.example) for the full template. Complete configuration 
 | `ZALO_CREDENTIALS_PATH` | `./credentials.json` | app | Zalo login credentials written after QR login. Keep private. |
 | `ZALO_SKIP_MUTED_GROUPS` | `0` | app | `1` skips messages from muted Zalo groups entirely. |
 | `ZALO_MUTE_SILENT` | `1` | app | `1` mirrors Zalo muted threads as silent Telegram messages; `0` always notifies. |
+| `ZALO_DM_NATIVE_REACTION` | `1` | app | `1` shows Zalo reactions in DMs as native Telegram reactions on the message; `0` always uses the aggregated `❤️ Name` summary reply like groups. |
+| `ZALO_EXCLUDE_THREADS` | empty | app | Comma-separated threads to never mirror: `type:id` (type `0`=DM, `1`=group); bare ids count as groups. Their messages, reactions and recalls are ignored entirely. |
 | `LOCAL_BOT_API` | `0` | app | `1` sends Telegram Bot API calls to `TG_LOCAL_SERVER`; `0` uses official `api.telegram.org`. |
 | `TG_LOCAL_SERVER` | `http://127.0.0.1:8081` | app / Compose override | Local Bot API endpoint. Required only when `LOCAL_BOT_API=1`; Compose overrides it to `http://telegram-bot-api:8081`. |
 | `TG_API_ID` | empty | Docker Compose | Telegram API ID for the `telegram-bot-api` container; get it from my.telegram.org. |

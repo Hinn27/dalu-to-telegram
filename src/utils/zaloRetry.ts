@@ -23,6 +23,7 @@ const TRANSIENT_CODES = new Set([
   'ENOTFOUND',
   'ECONNREFUSED',
   'ECONNABORTED',
+  'EAI_AGAIN',
   'UND_ERR_CONNECT_TIMEOUT',
   'UND_ERR_SOCKET',
 ]);
@@ -39,12 +40,16 @@ function isTransient(err: unknown): boolean {
   // Direct error code (e.g. Error [ETIMEDOUT])
   if (typeof e.code === 'string' && TRANSIENT_CODES.has(e.code)) return true;
 
-  // Message check for "fetch failed" / "network" / "timeout"
+  // Message check for common transient network failure phrasings.
+  // "socket hang up" / "terminated" come from node-fetch/undici (Telegram),
+  // "fetch failed" from native fetch (zca-js), "eai_again" is flaky DNS.
   if (typeof e.message === 'string') {
     const msg = e.message.toLowerCase();
-    if (msg.includes('fetch failed') || msg.includes('etimedout') ||
-        msg.includes('econnreset')   || msg.includes('enotfound') ||
-        msg.includes('network')      || msg.includes('timeout')) {
+    if (msg.includes('fetch failed')   || msg.includes('etimedout') ||
+        msg.includes('econnreset')     || msg.includes('enotfound') ||
+        msg.includes('network')        || msg.includes('timeout')   ||
+        msg.includes('socket hang up') || msg.includes('terminated') ||
+        msg.includes('eai_again')) {
       return true;
     }
   }

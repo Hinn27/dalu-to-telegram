@@ -15,7 +15,7 @@ import { config } from '../config.js';
 import { downloadToTemp, downloadToTempFromCandidates, cleanTemp, convertSpriteSheetToGif, sanitizeFileName, telegramMediaBatches, runWithConcurrency } from '../utils/media.js';
 import { applyZaloMarkupHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import type { ZaloStyle } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, friendsCache, recentlyRecalledMsgIds, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, reactionEventDedupeStore, aliasCache, friendsCache, recentlyRecalledMsgIds, recallNotifiedStore, type ZaloQuoteData } from '../store.js';
 import { tgQueue } from '../utils/tgQueue.js';
 import { maybeAutoReply } from './autoReply.js';
 
@@ -334,6 +334,14 @@ async function maybeRenameExistingDmTopic(
     console.log(`[Zalo→TG] Renamed DM topic for ${zaloId}: "${entry.name}" → "${displayName}"`);
   } catch (err) {
     if (isTopicDeletedError(err)) throw err;
+    // Telegram rejects renames whose formatted title equals the current one
+    // (raw displayName changed, rendered topic name didn't) — still record the
+    // new name locally and stay silent instead of spamming a warning (issue #65).
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/topic_not_modified|topic not modified/i.test(msg)) {
+      store.updateName(topicId, displayName);
+      return;
+    }
     console.warn(`[Zalo→TG] Failed to rename DM topic ${topicId} for ${zaloId}:`, err);
   }
 }
@@ -819,6 +827,12 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const senderUid  = msg.isSelf && ownUid ? ownUid : (msg.data.uidFrom ?? '');
       const senderName = msg.isSelf ? 'Bạn' : (msg.data.dName ?? msg.data.uidFrom);
       const msgType    = msg.data.msgType ?? ZALO_MSG_TYPES.TEXT;
+
+      // Skip threads explicitly excluded via ZALO_EXCLUDE_THREADS (issue #61)
+      if (config.zalo.excludeThreads[`${type}:${zaloId}`]) {
+        console.log(`[Zalo→TG] Skip excluded thread ${zaloId} (type=${type})`);
+        return;
+      }
 
       if (type === ThreadType.Group && await isMutedZaloGroup(api, zaloId)) {
         console.log(`[Zalo→TG] Skip muted group ${zaloId}`);
@@ -2016,17 +2030,36 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const topicId = store.getTopicByZalo(String(zaloId), type);
       if (topicId === undefined) return;
 
-      // Reply to the original forwarded TG message to notify it was recalled on Zalo
-      await tg.sendMessage(
-        config.telegram.groupId,
-        `<i>🗑 Tin nhắn này đã bị thu hồi trên Zalo</i>`,
-        {
-          message_thread_id: topicId,
-          parse_mode: 'HTML',
-          reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
-        },
-      );
-      console.log(`[ZaloHandler] Undo: notified recall for TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
+      // Skip threads explicitly excluded via ZALO_EXCLUDE_THREADS (issue #61)
+      if (config.zalo.excludeThreads[`${type}:${String(zaloId)}`]) {
+        console.log(`[ZaloHandler] Undo: skip excluded thread ${zaloId}`);
+        return;
+      }
+
+      // Dedupe: the reconnect catch-up sync replays undo events that were
+      // already delivered live — skip the ones we already notified (issue #65).
+      if (!recallNotifiedStore.markIfFirst(zaloMsgId)) {
+        console.log(`[ZaloHandler] Undo: already notified for msgId=${zaloMsgId}, skipping duplicate`);
+        return;
+      }
+
+      try {
+        // Reply to the original forwarded TG message to notify it was recalled on Zalo
+        await tg.sendMessage(
+          config.telegram.groupId,
+          `<i>🗑 Tin nhắn này đã bị thu hồi trên Zalo</i>`,
+          {
+            message_thread_id: topicId,
+            parse_mode: 'HTML',
+            reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
+          },
+        );
+        console.log(`[ZaloHandler] Undo: notified recall for TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
+      } catch (sendErr) {
+        // Notification failed — unmark so a replayed event can retry it
+        recallNotifiedStore.unmark(zaloMsgId);
+        throw sendErr;
+      }
     } catch (err) {
       console.error('[ZaloHandler] Undo error:', err);
     }
@@ -2145,6 +2178,12 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const topicId = store.getTopicByZalo(zaloId, type);
       if (topicId === undefined) return;
 
+      // Skip threads explicitly excluded via ZALO_EXCLUDE_THREADS (issue #61)
+      if (config.zalo.excludeThreads[`${type}:${zaloId}`]) {
+        console.log(`[ZaloHandler] Reaction: skip excluded thread ${zaloId}`);
+        return;
+      }
+
       // In 1-1 DMs, attach the reaction directly onto the Telegram message
       // (clean, no reply) — there's only one possible reactor, so no name is
       // needed. A bot reaction shows as the bot and Telegram can only hold one
@@ -2153,8 +2192,10 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       // named summary reply below, which can tell multiple reactors apart.
       // The bot's own reactions don't generate message_reaction updates, so this
       // can't echo back to Zalo. Unmappable/rejected icons also fall through.
+      // ZALO_DM_NATIVE_REACTION=0 opts out of native DM reactions and always
+      // uses the named summary reply (issue #65).
       const tgReaction = ZALO_TO_TG_REACTION[rIcon];
-      if (type === 0 && tgReaction) {
+      if (type === 0 && tgReaction && config.zalo.dmNativeReaction) {
         try {
           await tg.setMessageReaction(
             config.telegram.groupId,

@@ -14,6 +14,36 @@ export function markRecalled(msgId: string): void {
   setTimeout(() => recentlyRecalledMsgIds.delete(msgId), 5_000);
 }
 
+/**
+ * Track Zalo message IDs whose recall was already notified to Telegram.
+ *
+ * After a reconnect, the catch-up sync (requestOldMessages) replays undo
+ * events that were already delivered live — without this dedupe the same
+ * "🗑 đã thu hồi" notice is sent again (issue #65). A Zalo message can only
+ * be recalled once, so entries never expire; the set is bounded FIFO.
+ */
+const RECALL_NOTIFIED_MAX = 20_000;
+const _recallNotifiedMsgIds = new Set<string>();
+export const recallNotifiedStore = {
+  /** Returns true (and marks) if this recall was NOT notified before. */
+  markIfFirst(msgId: string): boolean {
+    if (_recallNotifiedMsgIds.has(msgId)) return false;
+    if (_recallNotifiedMsgIds.size >= RECALL_NOTIFIED_MAX) {
+      const oldest = _recallNotifiedMsgIds.values().next().value as string | undefined;
+      if (oldest !== undefined) _recallNotifiedMsgIds.delete(oldest);
+    }
+    _recallNotifiedMsgIds.add(msgId);
+    return true;
+  },
+  /** Unmark (e.g. when the notification send failed and may be retried). */
+  unmark(msgId: string): void {
+    _recallNotifiedMsgIds.delete(msgId);
+  },
+  stats(): { entries: number } {
+    return { entries: _recallNotifiedMsgIds.size };
+  },
+};
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface TopicEntry {

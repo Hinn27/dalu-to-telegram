@@ -51,6 +51,7 @@ import { loadAppSession, invalidateAppSession, appGetReceivedFriendRequests, app
 import { resetMemberCacheLoaded } from '../zalo/handler.js';
 import { escapeHtml } from '../utils/format.js';
 import { zaloApiWithRetry, isTransientNetworkError } from '../utils/zaloRetry.js';
+import { tgQueue } from '../utils/tgQueue.js';
 import { requestShutdown } from '../lifecycle.js';
 
 // Bridge start time (module load = process start)
@@ -315,7 +316,8 @@ async function sendQrPhoto(
     try {
       // telegram-bot-api --local expects a file URI. A bare absolute path is
       // parsed as an HTTP URL and rejected with "URL host is empty".
-      await tgBot.telegram.sendPhoto(chatId, pathToFileURL(imagePath).toString(), options);
+      // tgQueue retries transient network errors (socket hang up, ETIMEDOUT…).
+      await tgQueue(() => tgBot.telegram.sendPhoto(chatId, pathToFileURL(imagePath).toString(), options));
       return;
     } catch (err: any) {
       const description = err?.response?.description ?? err?.message ?? '';
@@ -327,11 +329,13 @@ async function sendQrPhoto(
   }
 
   const image = await readFile(imagePath);
-  await tgBot.telegram.sendPhoto(
+  // tgQueue retries transient network errors so a brief hiccup no longer
+  // aborts the whole QR login flow (issue #66).
+  await tgQueue(() => tgBot.telegram.sendPhoto(
     chatId,
     { source: image, filename: 'zalo-qr.png' },
     options,
-  );
+  ));
 }
 
 /**
@@ -2320,6 +2324,8 @@ export function setupTelegramHandler(
   }
 
   tgBot.on('message', async (ctx) => {
+    // Set by notifyError so the outer catch below doesn't double-notify.
+    let errorNotified = false;
     try {
       const msg = ctx.message;
       if (ctx.from?.is_bot) return;
@@ -2355,6 +2361,7 @@ export function setupTelegramHandler(
 
       // Helper: send TG error notification back to the same topic
       const notifyError = async (action: string, err: unknown) => {
+        errorNotified = true;
         const errMsg = err instanceof Error ? err.message : String(err);
         const code = (err as { code?: number })?.code;
         console.error(`[TG→Zalo] ${action} failed (zaloId=${zaloId}, type=${threadType}):`, err);
@@ -2478,6 +2485,7 @@ export function setupTelegramHandler(
         fileSize?: number,
         caption?: string,
         captionMentions?: Array<{ pos: number; uid: string; len: number }>,
+        forceFile = false,
       ) => {
         if (fileSize !== undefined && fileSize > TG_FILE_LIMIT) {
           await notifyTooBig(filename, fileSize);
@@ -2529,7 +2537,15 @@ export function setupTelegramHandler(
           const effectiveCaption = caption ?? '';
 
           let attachmentSource: AttachmentSource[] = [localPath];
-          if (!['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4'].includes(path.extname(filename).slice(1).toLowerCase())) {
+          const ext = path.extname(filename).slice(1).toLowerCase();
+          // zca-js classifies attachments purely by extension: jpg/jpeg/png/webp
+          // always upload as photos (and need path-based dimension probing), gif
+          // is special-cased — those stay path-based even for "send as file".
+          // mp4 documents are steered into the generic file path when forceFile
+          // is set, so Zalo keeps the clean original filename instead of the
+          // bridge's temp-file prefix, and the file downloads as a document.
+          const canForceFile = ext === 'mp4';
+          if (!['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4'].includes(ext) || (forceFile && canForceFile)) {
             const fileBuffer = await readFile(localPath);
             attachmentSource = [{
               data: fileBuffer,
@@ -2802,7 +2818,22 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         const doc   = msg.document;
         const fname = doc.file_name ?? `file_${Date.now()}.bin`;
         const { cap, capMentions } = getCaptionMentions();
-        await sendAttachment(doc.file_id, fname, doc.file_size, cap, capMentions);
+        // Sent "as file" on Telegram → keep it a file on Zalo (forceFile):
+        // mp4 keeps its original filename instead of playing inline under the
+        // bridge's temp name. jpg/png still render as photos — zca-js (and the
+        // Zalo Web API underneath) classifies image extensions unconditionally.
+        await sendAttachment(doc.file_id, fname, doc.file_size, cap, capMentions, true);
+        return;
+      }
+
+      if ('audio' in msg && msg.audio) {
+        // Telegram music/audio uploads (mp3, flac, wav, m4r, …) arrive as
+        // msg.audio — not msg.voice and not msg.document — and used to fall
+        // through unhandled, silently dropping the message (issue #65).
+        const aud   = msg.audio;
+        const fname = aud.file_name ?? `audio_${Date.now()}.mp3`;
+        const { cap, capMentions } = getCaptionMentions();
+        await sendAttachment(aud.file_id, fname, aud.file_size, cap, capMentions);
         return;
       }
 
@@ -3213,6 +3244,23 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
       }
     } catch (err) {
       console.error('[TG→Zalo] Error:', err);
+      // Surface unhandled send failures to the user instead of silently dropping
+      // the message (issue #65). Inner handlers that already notified set
+      // errorNotified so we don't send a second warning for the same message.
+      if (!errorNotified) {
+        const failedTopicId =
+          ctx.message && 'message_thread_id' in ctx.message
+            ? (ctx.message.message_thread_id as number | undefined)
+            : undefined;
+        if (failedTopicId) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          await tgBot.telegram.sendMessage(
+            config.telegram.groupId,
+            `⚠️ Gửi thất bại: <b>gửi sang Zalo</b>\n<code>${escapeHtml(errMsg)}</code>`,
+            { message_thread_id: failedTopicId, parse_mode: 'HTML' },
+          ).catch(() => undefined);
+        }
+      }
     }
   });
 

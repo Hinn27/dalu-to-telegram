@@ -50,6 +50,7 @@ import { cancelActiveAppLogin, triggerAppLogin } from '../zalo/loginApp.js';
 import { loadAppSession, invalidateAppSession, appGetReceivedFriendRequests, appGetSentFriendRequests, appGetGroupInfo, appGetGroupMembersInfo } from '../zalo/appApi.js';
 import { resetMemberCacheLoaded } from '../zalo/handler.js';
 import { escapeHtml } from '../utils/format.js';
+import { zaloApiWithRetry, isTransientNetworkError } from '../utils/zaloRetry.js';
 import { requestShutdown } from '../lifecycle.js';
 
 // Bridge start time (module load = process start)
@@ -2150,8 +2151,9 @@ export function setupTelegramHandler(
           return;
         }
         // Snapshot the reconnectable Zalo singleton so a mid-recall reconnect
-        // can't swap it out under us.
-        const api = currentApi;
+        // can't swap it out under us. Wrapped with zaloApiWithRetry so every
+        // api.* call automatically retries on transient network errors.
+        const api = zaloApiWithRetry(currentApi);
         const { ThreadType } = await import('zca-js');
         let zaloId: string | undefined;
         let threadType: 0 | 1 = 0;
@@ -2335,8 +2337,10 @@ export function setupTelegramHandler(
         return;
       }
 
-      // Capture api reference so closures below always use the same instance
-      const api = currentApi;
+      // Capture api reference so closures below always use the same instance.
+      // Wrapped with zaloApiWithRetry so every api.* call automatically retries
+      // on transient network errors (ETIMEDOUT, ECONNRESET, ...) before giving up.
+      const api = zaloApiWithRetry(currentApi);
 
       // Look up the corresponding Zalo conversation
       const entry = store.getEntryByTopic(topicId);
@@ -2357,7 +2361,10 @@ export function setupTelegramHandler(
 
         // Provide a friendlier explanation for common Zalo error codes
         let hint = '';
-        if (code === 114) {
+        if (isTransientNetworkError(err)) {
+          // Retries exhausted — give the user actionable context
+          hint = '\n💡 <i>Lỗi mạng tạm thời — đã thử lại 4 lần nhưng không thành công. Kiểm tra kết nối mạng.</i>';
+        } else if (code === 114) {
           hint = threadType === ThreadType.User
             ? '\n💡 <i>Zalo từ chối: chưa kết bạn hoặc người dùng đã bật giới hạn tin nhắn từ người lạ.</i>'
             : '\n💡 <i>Zalo từ chối tham số (code 114).</i>';
@@ -3280,7 +3287,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
       }
 
       if (!currentApi) return;
-      const api = currentApi;
+      const api = zaloApiWithRetry(currentApi);
 
       // Map TG 0-based option indices → Zalo option_ids
       const optionIds = answer.option_ids

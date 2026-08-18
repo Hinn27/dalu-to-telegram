@@ -518,7 +518,7 @@ async function withLocalMediaFallback<T>(
   } catch (err) {
     const description = telegramErrorDescription(err);
     const isLocalFileError = telegramErrorCode(err) === 400
-      && /(file:\/\/|http url|url host|wrong file|failed to get.*url|file.*not found|can't open)/i.test(description);
+      && /(file:\/\/|http url|url host|wrong file|failed to get.*url|file.*not found|can't open|unsupported.*protocol)/i.test(description);
     if (!config.telegram.localServer || !isLocalFileError) throw err;
     console.warn(`[Zalo→TG] ${label}: local URI rejected (${description}); retrying multipart`);
     return operation(true);

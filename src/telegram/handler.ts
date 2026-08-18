@@ -311,10 +311,18 @@ async function sendQrPhoto(
   };
 
   if (config.telegram.localServer) {
-    // telegram-bot-api --local expects a file URI. A bare absolute path is
-    // parsed as an HTTP URL and rejected with "URL host is empty".
-    await tgBot.telegram.sendPhoto(chatId, pathToFileURL(imagePath).toString(), options);
-    return;
+    try {
+      // telegram-bot-api --local expects a file URI. A bare absolute path is
+      // parsed as an HTTP URL and rejected with "URL host is empty".
+      await tgBot.telegram.sendPhoto(chatId, pathToFileURL(imagePath).toString(), options);
+      return;
+    } catch (err: any) {
+      const description = err?.response?.description ?? err?.message ?? '';
+      const isLocalFileError = err?.response?.error_code === 400
+        && /(file:\/\/|http url|url host|wrong file|failed to get.*url|file.*not found|can't open|unsupported.*protocol)/i.test(description);
+      if (!isLocalFileError) throw err;
+      console.warn(`[Telegram] QR delivery: local URI rejected (${description}); retrying multipart`);
+    }
   }
 
   const image = await readFile(imagePath);

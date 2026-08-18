@@ -93,7 +93,11 @@ TG_TOKEN=123456:telegram-bot-token
 TG_GROUP_ID=-1001234567890
 ```
 
-Copy [.env.example](.env.example) for the full template. Complete configuration reference:
+Everything else can be configured interactively: with just those two keys filled in,
+send `/setup` in the bridge group (admin only) — the wizard asks for every optional
+variable one by one using inline buttons for booleans and chat input for free-form
+values, then writes the answers back to `.env` (apply with `/restart`).
+Open [.env.example](.env.example) for the full template. Complete configuration reference:
 
 | Variable | Default / example | Used by | Purpose |
 | --- | --- | --- | --- |

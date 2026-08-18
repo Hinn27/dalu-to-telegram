@@ -93,6 +93,11 @@ TG_TOKEN=123456:telegram-bot-token
 TG_GROUP_ID=-1001234567890
 ```
 
+Tất cả biến còn lại có thể cấu hình trực tiếp qua bot: chỉ cần điền 2 biến trên,
+gửi `/setup` trong group bridge (chỉ admin) — wizard sẽ hỏi lần lượt từng biến tuỳ chọn,
+dùng nút inline cho biến boolean và nhập tin nhắn cho biến dạng văn bản, sau đó tự ghi
+kết quả vào `.env` (áp dụng bằng `/restart`, dùng Docker thì cập nhật thêm trong compose).
+
 Copy [.env.example](.env.example) để có template đầy đủ. Bảng config đầy đủ:
 
 | Biến | Mặc định / ví dụ | Nơi dùng | Công dụng |

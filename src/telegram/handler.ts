@@ -53,6 +53,7 @@ import { escapeHtml } from '../utils/format.js';
 import { zaloApiWithRetry, isTransientNetworkError } from '../utils/zaloRetry.js';
 import { tgQueue } from '../utils/tgQueue.js';
 import { requestShutdown } from '../lifecycle.js';
+import { startSetupWizard, handleSetupCallback, hasActiveSetup, consumeSetupTextAndAdvance } from './setupWizard.js';
 
 // Bridge start time (module load = process start)
 const _bridgeStartTime = Date.now();
@@ -543,6 +544,28 @@ export function setupTelegramHandler(
         },
       },
     );
+  });
+
+  // /setup – interactive env wizard (bool via inline buttons, free-form via chat input)
+  tgBot.command('setup', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? ctx.message.message_thread_id
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+    if (!await isTelegramGroupAdmin(ctx.from.id)) {
+      await ctx.reply('⛔ Chỉ admin Telegram mới có thể cấu hình bridge.', replyOpts);
+      return;
+    }
+    if (hasActiveSetup(ctx.from.id)) {
+      await ctx.reply('⚙️ Đang có phiên cấu hình — hoàn tất nó trước (hoặc bấm Huỷ).', replyOpts);
+      return;
+    }
+    await ctx.reply(
+      '⚙️ Bắt đầu cấu hình bridge. Trả lời từng bước — các biến boolean dùng nút bấm, các biến khác nhập tin nhắn trong nhóm.',
+      replyOpts,
+    );
+    startSetupWizard(ctx.from.id, threadId, (text, opts) => ctx.reply(text, { ...replyOpts, ...opts }));
   });
 
   // /topic – manage bridge topic mappings
@@ -1639,6 +1662,21 @@ export function setupTelegramHandler(
   tgBot.on('callback_query', async (ctx) => {
     const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
 
+    if (data?.startsWith('setup:')) {
+      const callbackMessage = ctx.callbackQuery.message;
+      const setupChatId = callbackMessage?.chat.id;
+      const setupThreadId = callbackMessage && 'message_thread_id' in callbackMessage
+        ? callbackMessage.message_thread_id
+        : undefined;
+      if (setupChatId === undefined) return;
+      const send = (text: string, opts?: object) => ctx.telegram.sendMessage(setupChatId, text, {
+        ...(setupThreadId !== undefined ? { message_thread_id: setupThreadId } : {}),
+        ...opts,
+      });
+      await handleSetupCallback(ctx, data, isTelegramGroupAdmin, send);
+      return;
+    }
+
     if (data?.startsWith('restart:')) {
       const [, action, ownerId] = data.split(':');
       if (String(ctx.from.id) !== ownerId || !await isTelegramGroupAdmin(ctx.from.id)) {
@@ -2336,6 +2374,14 @@ export function setupTelegramHandler(
       const topicId =
         'message_thread_id' in msg ? (msg.message_thread_id as number | undefined) : undefined;
       if (!topicId) return;
+
+      // Interactive setup wizard: consume free-form env values from chat input
+      if ('text' in msg && typeof msg.text === 'string' && !msg.text.startsWith('/')) {
+        if (consumeSetupTextAndAdvance(ctx.from.id, msg.text, (text, opts) =>
+          ctx.reply(text, { message_thread_id: topicId, ...opts }))) {
+          return;
+        }
+      }
 
       // Zalo not connected yet
       if (!currentApi) {

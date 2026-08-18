@@ -1,9 +1,6 @@
 import 'dotenv/config';
 import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = path.resolve(__dirname, '..');
+import { PROJECT_ROOT } from './utils/paths.js';
 
 function requireEnv(key: string): string {
   const val = process.env[key];

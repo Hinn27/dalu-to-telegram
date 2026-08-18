@@ -25,6 +25,7 @@ const BOT_COMMANDS = [
   { command: 'leavegroup',     description: 'Rời nhóm Zalo của topic hiện tại' },
   { command: 'status',         description: 'Xem trạng thái kết nối & thống kê bridge' },
   { command: 'restart',        description: 'Khởi động lại bridge (chỉ admin)' },
+  { command: 'setup',          description: 'Cấu hình biến env qua wizard (chỉ admin)' },
   { command: 'admin',          description: 'Admin panel: trạng thái, cache, tra mapping' },
   { command: 'update',         description: 'Kiểm tra bản cập nhật mới cho bridge' },
   { command: 'seed',           description: 'Xem mã seed giải mã backup Zalo' },

@@ -200,6 +200,31 @@ test('reactionEventDedupeStore normalizes target order and actor names', () => {
   assert.equal(second, true);
 });
 
+test('reactionEventDedupeStore counts repeated actions by actionId and dedupes replays of the same action', () => {
+  // Repeated identical tap → new actionId → NOT a duplicate
+  assert.equal(
+    reactionEventDedupeStore.isDuplicateZaloInbound({ zaloId: 'g', targetMsgIds: ['m'], icon: '/-heart', actionId: 'act-1' }),
+    false,
+  );
+  assert.equal(
+    reactionEventDedupeStore.isDuplicateZaloInbound({ zaloId: 'g', targetMsgIds: ['m'], icon: '/-heart', actionId: 'act-2' }),
+    false,
+  );
+  // Same action re-emitted later (reconnect replay) → duplicate
+  assert.equal(
+    reactionEventDedupeStore.isDuplicateZaloInbound({ zaloId: 'g', targetMsgIds: ['m'], icon: '/-heart', actionId: 'act-1' }),
+    true,
+  );
+});
+
+test('reactionSummaryStore counts repeated same-emoji reactions per actor', () => {
+  const entry = reactionSummaryStore.upsert(9402, '❤️', 'Alice');
+  reactionSummaryStore.upsert(9402, '❤️', 'Alice');
+  reactionSummaryStore.upsert(9402, '❤️', 'Alice');
+  reactionSummaryStore.upsert(9402, '👍', 'Alice');
+  assert.equal(reactionSummaryStore.buildText(entry), '❤️ ×3 Alice  👍 Alice');
+});
+
 test('recallNotifiedStore suppresses duplicate recall notifications and allows re-mark after unmark', () => {
   assert.equal(recallNotifiedStore.markIfFirst('recall-1'), true);
   assert.equal(recallNotifiedStore.markIfFirst('recall-1'), false);
@@ -213,7 +238,7 @@ test('reactionSummaryStore does not duplicate the same actor per emoji', () => {
   const entry = reactionSummaryStore.upsert(9401, '❤️', 'Alice');
   reactionSummaryStore.upsert(9401, '❤️', 'Alice');
   reactionSummaryStore.upsert(9401, '👍', 'Bob');
-  assert.equal(reactionSummaryStore.buildText(entry), '❤️ Alice  👍 Bob');
+  assert.equal(reactionSummaryStore.buildText(entry), '❤️ ×2 Alice  👍 Bob');
 });
 
 test('pollStore removes stale Telegram and UUID indexes when a poll is replaced', () => {

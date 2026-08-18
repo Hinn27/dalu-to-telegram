@@ -2147,6 +2147,10 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
 
       const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom.trim() : '';
       const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
+      // Server-generated id unique per reaction action: repeated identical taps
+      // (same person dropping ❤️ several times) are counted, while re-emits of
+      // the same action are still deduped (issue #65).
+      const actionId = typeof data?.actionId === 'string' ? data.actionId.trim() : undefined;
 
       if (reactionEventDedupeStore.isDuplicateZaloInbound({
         zaloId,
@@ -2154,8 +2158,9 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         icon: rIcon,
         actorUid: actorUid || undefined,
         actorName: rawName || undefined,
+        actionId,
       })) {
-        console.log(`[ZaloHandler] Reaction: skip duplicate event ${zaloId}/${targetMsgIds.join('|')}/${rIcon}`);
+        console.log(`[ZaloHandler] Reaction: skip duplicate event ${zaloId}/${targetMsgIds.join('|')}/${rIcon} action=${actionId ?? '-'}`);
         return;
       }
 

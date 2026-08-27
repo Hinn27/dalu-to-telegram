@@ -1,9 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { ThreadType } from 'zca-js';
 import { config } from '../config.js';
 import { sentMsgStore } from '../store.js';
 import type { ZaloAPI } from './types.js';
+import { withZaloRetry } from '../utils/zaloRetry.js';
 
 /**
  * Bridge-level auto-reply ("offline mode").
@@ -67,6 +68,7 @@ load();
 
 function save(): void {
   try {
+    mkdirSync(path.dirname(FILE), { recursive: true });
     writeFileSync(FILE, JSON.stringify(state, null, 2), 'utf8');
   } catch (err) {
     console.warn('[AutoReply] Failed to save state:', err);
@@ -120,8 +122,11 @@ export async function maybeAutoReply(
   // into the Telegram topic (consistent with every TG→Zalo send path).
   sentMsgStore.markSending(threadId);
   try {
-    const res = await api.sendMessage({ msg: state.message }, threadId, ThreadType.User) as
-      { message?: { msgId?: string | number } };
+    const res = await withZaloRetry(
+      () => api.sendMessage({ msg: state.message }, threadId, ThreadType.User) as
+        Promise<{ message?: { msgId?: string | number } }>,
+      'autoReply.sendMessage',
+    );
     const zMsgId = res?.message?.msgId;
     if (zMsgId !== undefined) {
       sentMsgStore.save(_syntheticTgSeq--, { msgIds: [zMsgId], zaloId: threadId, threadType: 0 });

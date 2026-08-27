@@ -28,16 +28,24 @@ const PC_UA          = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTM
 
 interface AppSession {
   zpw_enk: string;
+  dkey?:   string;
   imei:    string;
   cookies: Array<{ name: string; value: string; domain: string }>;
 }
 
 let _session: AppSession | null | undefined;  // undefined = not yet loaded
 
-function loadAppSession(): AppSession | null {
+export function loadAppSession(): AppSession | null {
   if (_session !== undefined) return _session;
+  return _reloadAppSession();
+}
+
+function _reloadAppSession(): AppSession | null {
   const p = path.join(path.dirname(config.zalo.credentialsPath), 'app-session.json');
-  if (!existsSync(p)) { _session = null; return null; }
+  if (!existsSync(p)) {
+    _session = null;
+    return null;
+  }
   try {
     _session = JSON.parse(readFileSync(p, 'utf8')) as AppSession;
     return _session;
@@ -50,6 +58,15 @@ function loadAppSession(): AppSession | null {
 /** Call this after a new /loginapp to reload the session from disk. */
 export function invalidateAppSession(): void {
   _session = undefined;
+}
+
+/**
+ * Force a fresh read from disk, ignoring the cache.
+ * Useful when the file may have been written between calls.
+ */
+export function reloadAppSession(): AppSession | null {
+  _session = undefined;
+  return _reloadAppSession();
 }
 
 // ── Crypto (same as loginApp.ts) ──────────────────────────────────────────────
@@ -129,6 +146,7 @@ export async function appGetGroupInfo(groupId: string): Promise<AppGroupData | n
           'Cookie':       buildCookieHeader(sess.cookies, url),
         },
         timeout: 15_000,
+        family:  4, // avoid IPv6 Happy-Eyeballs stalls in Docker (see media.ts)
       },
     );
 
@@ -184,6 +202,7 @@ export async function appGetGroupMembersInfo(uids: string[]): Promise<Map<string
             'Cookie':       buildCookieHeader(sess.cookies, url),
           },
           timeout: 15_000,
+          family:  4, // avoid IPv6 Happy-Eyeballs stalls in Docker (see media.ts)
         },
       );
 
@@ -243,6 +262,7 @@ export async function appGetReceivedFriendRequests(count = 200, offset = 0): Pro
         'Cookie': buildCookieHeader(sess.cookies, url),
       },
       timeout: 15_000,
+      family:  4, // avoid IPv6 Happy-Eyeballs stalls in Docker (see media.ts)
     });
 
     if (resp.data.error_code !== 0 || !resp.data.data) {
@@ -277,6 +297,7 @@ export async function appGetSentFriendRequests(count = 200, offset = 0): Promise
         'Cookie': buildCookieHeader(sess.cookies, url),
       },
       timeout: 15_000,
+      family:  4, // avoid IPv6 Happy-Eyeballs stalls in Docker (see media.ts)
     });
 
     if (resp.data.error_code !== 0 || !resp.data.data) {

@@ -14,6 +14,36 @@ export function markRecalled(msgId: string): void {
   setTimeout(() => recentlyRecalledMsgIds.delete(msgId), 5_000);
 }
 
+/**
+ * Track Zalo message IDs whose recall was already notified to Telegram.
+ *
+ * After a reconnect, the catch-up sync (requestOldMessages) replays undo
+ * events that were already delivered live — without this dedupe the same
+ * "🗑 đã thu hồi" notice is sent again (issue #65). A Zalo message can only
+ * be recalled once, so entries never expire; the set is bounded FIFO.
+ */
+const RECALL_NOTIFIED_MAX = 20_000;
+const _recallNotifiedMsgIds = new Set<string>();
+export const recallNotifiedStore = {
+  /** Returns true (and marks) if this recall was NOT notified before. */
+  markIfFirst(msgId: string): boolean {
+    if (_recallNotifiedMsgIds.has(msgId)) return false;
+    if (_recallNotifiedMsgIds.size >= RECALL_NOTIFIED_MAX) {
+      const oldest = _recallNotifiedMsgIds.values().next().value as string | undefined;
+      if (oldest !== undefined) _recallNotifiedMsgIds.delete(oldest);
+    }
+    _recallNotifiedMsgIds.add(msgId);
+    return true;
+  },
+  /** Unmark (e.g. when the notification send failed and may be retried). */
+  unmark(msgId: string): void {
+    _recallNotifiedMsgIds.delete(msgId);
+  },
+  stats(): { entries: number } {
+    return { entries: _recallNotifiedMsgIds.size };
+  },
+};
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface TopicEntry {
@@ -71,8 +101,26 @@ export const store = {
 
   /** Persist a new topic ↔ Zalo mapping. */
   set(entry: TopicEntry): void {
+    // Keep the two indexes strictly one-to-one. Reusing a Telegram topic for a
+    // different Zalo thread must remove the old reverse lookup, and remapping a
+    // Zalo thread to a new topic must remove the stale topic entry.
+    const previousAtTopic = _data.topics[String(entry.topicId)];
+    if (previousAtTopic) {
+      const previousKey = zaloKey(previousAtTopic.zaloId, previousAtTopic.type);
+      if (previousKey !== zaloKey(entry.zaloId, entry.type)
+        && _data.zaloIndex[previousKey] === entry.topicId) {
+        delete _data.zaloIndex[previousKey];
+      }
+    }
+
+    const key = zaloKey(entry.zaloId, entry.type);
+    const previousTopicId = _data.zaloIndex[key];
+    if (previousTopicId !== undefined && previousTopicId !== entry.topicId) {
+      delete _data.topics[String(previousTopicId)];
+    }
+
     _data.topics[String(entry.topicId)] = entry;
-    _data.zaloIndex[zaloKey(entry.zaloId, entry.type)] = entry.topicId;
+    _data.zaloIndex[key] = entry.topicId;
     persist(_data);
   },
 
@@ -309,12 +357,23 @@ export const msgStore = {
   save(tgMsgId: number, zaloMsgIds: string[], quote: ZaloQuoteData): void {
     // Drop sentinel "0" and empty IDs — they are realMsgId=0 placeholders,
     // nobody ever queries getTgMsgId("0") so storing them is pure waste.
-    const validIds = zaloMsgIds.filter(id => id && id !== '0');
-    while (_msgKeyOrder.length + validIds.length > MSG_CACHE_MAX) _evictOne();
+    const validIds = Array.from(new Set(zaloMsgIds.filter(id => id && id !== '0')));
+    const newIdCount = validIds.reduce((count, id) => count + (_zaloToTg.has(id) ? 0 : 1), 0);
+    while (_msgKeyOrder.length + newIdCount > MSG_CACHE_MAX) _evictOne();
     for (const id of validIds) {
-      if (!_zaloToTg.has(id)) {
+      const previousTgId = _zaloToTg.get(id);
+      if (previousTgId === undefined) {
         _tgRefCount.set(tgMsgId, (_tgRefCount.get(tgMsgId) ?? 0) + 1);
         _msgKeyOrder.push(id);
+      } else if (previousTgId !== tgMsgId) {
+        const previousRemaining = (_tgRefCount.get(previousTgId) ?? 1) - 1;
+        if (previousRemaining <= 0) {
+          _tgRefCount.delete(previousTgId);
+          _tgToQuote.delete(previousTgId);
+        } else {
+          _tgRefCount.set(previousTgId, previousRemaining);
+        }
+        _tgRefCount.set(tgMsgId, (_tgRefCount.get(tgMsgId) ?? 0) + 1);
       }
       _zaloToTg.set(id, tgMsgId);
     }
@@ -429,7 +488,6 @@ function _loadUserCache(): void {
     for (const [gid, members] of Object.entries(raw.gn ?? {})) {
       _groupUidToName.set(gid, new Map(Object.entries(members)));
     }
-    console.log(`[userCache] Loaded ${_uidToName.size} users from disk`);
   } catch (e) {
     console.warn('[userCache] Failed to load cache:', e);
   }
@@ -486,11 +544,16 @@ export const userCache = {
         // Xoá luôn trong _groupNameToUid để tránh rò rỉ
         for (const [, nameMap] of _groupNameToUid) {
           for (const [norm, uid2] of nameMap) {
-            if (uid2 === firstUid) { nameMap.delete(norm); break; }
+            if (uid2 === firstUid) nameMap.delete(norm);
           }
         }
         for (const [, uidMap] of _groupUidToName) uidMap.delete(firstUid);
       }
+    }
+    const previousName = _uidToName.get(uid);
+    if (previousName && previousName !== displayName) {
+      const previousNorm = _normName(previousName);
+      if (_normToUid.get(previousNorm) === uid) _normToUid.delete(previousNorm);
     }
     _uidToName.set(uid, displayName);
     _normToUid.set(_normName(displayName), uid);
@@ -509,6 +572,11 @@ export const userCache = {
     if (!_uidToName.has(uid)) this.save(uid, displayName);
     let m = _groupNameToUid.get(zaloId);
     if (!m) { m = new Map(); _groupNameToUid.set(zaloId, m); }
+    const previousGroupName = _groupUidToName.get(zaloId)?.get(uid);
+    if (previousGroupName && previousGroupName !== displayName) {
+      const previousNorm = _normName(previousGroupName);
+      if (m.get(previousNorm) === uid) m.delete(previousNorm);
+    }
     m.set(_normName(displayName), uid);
     let names = _groupUidToName.get(zaloId);
     if (!names) { names = new Map(); _groupUidToName.set(zaloId, names); }
@@ -557,6 +625,13 @@ export const aliasCache = {
     for (const { userId, alias, displayName } of items) {
       const name = (alias ?? displayName)?.trim();
       if (name) {
+        const previous = _aliasMap.get(userId);
+        if (previous && previous !== name) {
+          const previousNorm = _normName(previous);
+          if (_aliasNormToUid.get(previousNorm) === userId) {
+            _aliasNormToUid.delete(previousNorm);
+          }
+        }
         _aliasMap.set(userId, name);
         _aliasNormToUid.set(_normName(name), userId);
       }
@@ -604,8 +679,7 @@ function upsertAliasFromFriend(friend: ZaloFriend): void {
   // whenever getAllFriends refreshed.
   const alias = friend.alias?.trim();
   if (!alias) return;
-  _aliasMap.set(friend.userId, alias);
-  _aliasNormToUid.set(_normName(alias), friend.userId);
+  aliasCache.merge([{ userId: friend.userId, alias }]);
 }
 
 const FRIENDS_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -708,7 +782,7 @@ const _sentKeyOrder: number[] = [];
 const SENT_MAP_MAX = 5000;
 
 /** zaloId values currently being sent by the bot (to handle echo race condition) */
-const _pendingSendConvos = new Map<string, number>(); // zaloId → timestamp
+const _pendingSendConvos = new Map<string, { count: number; markedAt: number }>();
 
 export const sentMsgStore = {
   /** Record a message we sent from TG→Zalo. tgMsgId is the user's TG message. */
@@ -725,6 +799,13 @@ export const sentMsgStore = {
             _sentByZaloId.delete(String(mid));
           }
         }
+      }
+    }
+    const previous = _sentMap.get(tgMsgId);
+    if (previous) {
+      for (const mid of previous.msgIds) {
+        const key = String(mid);
+        if (_sentByZaloId.get(key) === tgMsgId) _sentByZaloId.delete(key);
       }
     }
     _sentMap.set(tgMsgId, info);
@@ -752,25 +833,37 @@ export const sentMsgStore = {
    * back the message before the HTTP response (and sentMsgStore.save) arrives.
    */
   markSending(zaloId: string): void {
-    _pendingSendConvos.set(zaloId, Date.now());
+    const current = _pendingSendConvos.get(zaloId);
+    _pendingSendConvos.set(zaloId, {
+      count: (current?.count ?? 0) + 1,
+      markedAt: Date.now(),
+    });
   },
 
   /** Call AFTER sentMsgStore.save() or on send error. */
   unmarkSending(zaloId: string): void {
-    _pendingSendConvos.delete(zaloId);
+    const current = _pendingSendConvos.get(zaloId);
+    if (!current || current.count <= 1) {
+      _pendingSendConvos.delete(zaloId);
+      return;
+    }
+    _pendingSendConvos.set(zaloId, { ...current, count: current.count - 1 });
   },
 
   /**
    * Returns true if the bot is currently sending to this zaloId.
    * Used to suppress isSelf echo in the Zalo listener.
-   * The echo handler in zalo/handler.ts now skips all isSelf messages
-   * unconditionally, so the primary echo suppression no longer depends
-   * on this window. Reduced from 15s to 5s to minimise false suppression
-   * of genuine messages arriving from other devices.
+   * A long safety expiry prevents a leaked marker from surviving forever;
+   * normal operations remove their reference in finally blocks.
    */
   isSendingTo(zaloId: string): boolean {
-    const ts = _pendingSendConvos.get(zaloId);
-    return ts !== undefined && Date.now() - ts < 5_000;
+    const pending = _pendingSendConvos.get(zaloId);
+    if (!pending) return false;
+    if (Date.now() - pending.markedAt >= 10 * 60_000) {
+      _pendingSendConvos.delete(zaloId);
+      return false;
+    }
+    return pending.count > 0;
   },
 
   stats(): { entries: number } {
@@ -783,8 +876,9 @@ export const sentMsgStore = {
 export interface ReactionSummaryEntry {
   summaryTgMsgId: number | null;
   lastSentText: string;
-  /** emoji → actor display names (ordered by arrival) */
-  reactions: Record<string, string[]>;
+  /** emoji → actor display name → count (Zalo lets one person drop the same
+   *  icon multiple times; total is a real number, e.g. ❤️ ×3) */
+  reactions: Record<string, Record<string, number>>;
   debounceTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -806,10 +900,8 @@ export const reactionSummaryStore = {
       entry = { summaryTgMsgId: null, lastSentText: '', reactions: {}, debounceTimer: null };
       _reactionSummaries.set(tgMsgId, entry);
     }
-    if (!entry.reactions[emoji]) entry.reactions[emoji] = [];
-    if (!entry.reactions[emoji]!.includes(actorName)) {
-      entry.reactions[emoji]!.push(actorName);
-    }
+    if (!entry.reactions[emoji]) entry.reactions[emoji] = {};
+    entry.reactions[emoji]![actorName] = (entry.reactions[emoji]![actorName] ?? 0) + 1;
     return entry;
   },
 
@@ -823,10 +915,13 @@ export const reactionSummaryStore = {
   },
 
   buildText(entry: ReactionSummaryEntry): string {
-    return Object.entries(entry.reactions)
-      .filter(([, names]) => names.length > 0)
-      .map(([emoji, names]) => `${emoji} ${names.join(', ')}`)
-      .join('  ');
+    const parts: string[] = [];
+    for (const [emoji, actors] of Object.entries(entry.reactions)) {
+      for (const [name, count] of Object.entries(actors)) {
+        parts.push(count > 1 ? `${emoji} ×${count} ${name}` : `${emoji} ${name}`);
+      }
+    }
+    return parts.join('  ');
   },
 };
 
@@ -881,7 +976,20 @@ export const reactionEchoStore = {
 
 const REACTION_EVENT_DEDUPE_TTL_MS = 15_000;
 const REACTION_EVENT_DEDUPE_MAX = 20_000;
+const REACTION_ACTION_MAX = 50_000;
 const _recentReactionEvents = new Map<string, number>();
+const _seenReactionActions = new Set<string>();
+
+/** Long-lived dedupe for reaction actionIds: unique per action, never expires. */
+function markReactionAction(actionId: string): boolean {
+  if (_seenReactionActions.has(actionId)) return true;
+  if (_seenReactionActions.size >= REACTION_ACTION_MAX) {
+    const oldest = _seenReactionActions.values().next().value as string | undefined;
+    if (oldest !== undefined) _seenReactionActions.delete(oldest);
+  }
+  _seenReactionActions.add(actionId);
+  return false;
+}
 
 function pruneRecentReactionEvents(now = Date.now()): void {
   for (const [key, ts] of _recentReactionEvents) {
@@ -920,7 +1028,16 @@ export const reactionEventDedupeStore = {
     icon: string;
     actorUid?: string;
     actorName?: string;
+    actionId?: string;
   }): boolean {
+    // Prefer the server-generated actionId: it is unique per reaction *action*,
+    // so repeated identical taps (the same person dropping ❤️ several times)
+    // are kept and counted, while re-emits/replays of the SAME action (even
+    // long after the live event, e.g. reconnect catch-up) are deduped (issue
+    // #65). The set never expires because an actionId can only occur once.
+    if (input.actionId?.trim()) {
+      return markReactionAction(input.actionId.trim());
+    }
     const targetKey = normalizeReactionMsgIds(input.targetMsgIds).join('|');
     if (!targetKey) return false;
     const actorKey = input.actorUid?.trim()
@@ -1008,6 +1125,7 @@ export const mediaGroupStore = {
 
 interface ZaloAlbumItem {
   url:    string;
+  fallbackUrls: string[];
   msgIds: string[];
   zaloQuote: ZaloQuoteData | undefined;
 }
@@ -1032,8 +1150,12 @@ export const zaloAlbumStore = {
     meta: Omit<ZaloAlbumBuffer, 'timer' | 'items' | 'caption'> & { zaloQuote: ZaloQuoteData | undefined },
     onFlush: (buf: Omit<ZaloAlbumBuffer, 'timer'>) => void | Promise<void>,
     _childnumber = 0,
+    fallbackUrls: readonly string[] = [],
   ): void {
     const { zaloQuote, ...bufferMeta } = meta;
+    const uniqueFallbackUrls = Array.from(new Set(
+      fallbackUrls.map(candidate => candidate.trim()).filter(candidate => candidate && candidate !== url),
+    ));
     const flush = (buf: ZaloAlbumBuffer): void => {
       _zaloAlbumBuffers.delete(key);
       void Promise.resolve(onFlush({
@@ -1052,19 +1174,26 @@ export const zaloAlbumStore = {
     const existing = _zaloAlbumBuffers.get(key);
     if (existing) {
       clearTimeout(existing.timer);
-      if (!existing.items.some(i => i.url === url)) {
-        existing.items.push({ url, msgIds: [...msgIds], zaloQuote });
+      const incomingUrls = new Set([url, ...uniqueFallbackUrls]);
+      const duplicateItem = existing.items.find(item =>
+        [item.url, ...item.fallbackUrls].some(candidate => incomingUrls.has(candidate)));
+      if (!duplicateItem) {
+        existing.items.push({ url, fallbackUrls: uniqueFallbackUrls, msgIds: [...msgIds], zaloQuote });
       } else {
         console.log(`[zaloAlbumStore] Skipping duplicate URL in album buffer (key=${key}, items=${existing.items.length})`);
-        const item = existing.items.find(i => i.url === url);
-        if (item) item.msgIds.push(...msgIds);
+        duplicateItem.msgIds.push(...msgIds);
+        duplicateItem.fallbackUrls = Array.from(new Set([
+          ...duplicateItem.fallbackUrls,
+          url,
+          ...uniqueFallbackUrls,
+        ].filter(candidate => candidate !== duplicateItem.url)));
       }
       if (!existing.caption && caption) existing.caption = caption;
       existing.timer = setTimeout(() => flush(existing), FLUSH_DELAY_MS);
     } else {
       const buf: ZaloAlbumBuffer = {
         ...bufferMeta,
-        items: [{ url, msgIds: [...msgIds], zaloQuote }],
+        items: [{ url, fallbackUrls: uniqueFallbackUrls, msgIds: [...msgIds], zaloQuote }],
         caption,
         timer: setTimeout(() => flush(buf), FLUSH_DELAY_MS),
       };
@@ -1134,6 +1263,15 @@ _loadPolls();
 
 export const pollStore = {
   save(entry: PollEntry): void {
+    const previous = _pollByZaloId.get(entry.pollId);
+    if (previous) {
+      if (_pollByTgId.get(previous.tgPollMsgId) === previous) {
+        _pollByTgId.delete(previous.tgPollMsgId);
+      }
+      if (_pollByUUID.get(previous.tgPollUUID) === previous) {
+        _pollByUUID.delete(previous.tgPollUUID);
+      }
+    }
     _pollByZaloId.set(entry.pollId, entry);
     _pollByTgId.set(entry.tgPollMsgId, entry);
     _pollByUUID.set(entry.tgPollUUID, entry);

@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/hinne/Desktop/dalu-to-telegram
 EnvironmentFile=/home/hinne/Desktop/dalu-to-telegram/.env
+Environment=ZALO_TG_RUNNER=1
 
 # Build first, then run compiled JS (tiết kiệm RAM hơn tsx)
 ExecStartPre=/usr/bin/pnpm run build

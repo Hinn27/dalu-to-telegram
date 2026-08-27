@@ -1,19 +1,21 @@
 import axios from 'axios';
 import { createWriteStream, mkdirSync, copyFileSync } from 'fs';
-import { stat, unlink } from 'fs/promises';
+import { readFile, stat, unlink, writeFile } from 'fs/promises';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import { gunzipSync } from 'zlib';
 import path from 'path';
-import os from 'os';
-import { config } from '../config.js';
+import { imageSizeFromFile } from 'image-size/fromFile';
+import { createSharedTempPath, getSharedTempDir } from './sharedTemp.js';
 
 // Local Bot API reads outgoing files from a shared host/container path.
-// macOS os.tmpdir() points to /var/folders, while our server and Docker setup
-// share /tmp, so keep bridge media there whenever local mode is enabled.
-const TMP_ROOT = config.telegram.localServer && process.platform !== 'win32'
-  ? '/tmp'
-  : os.tmpdir();
-const TMP_DIR = path.join(TMP_ROOT, 'zalo-tg');
+// Use a permission-safe resolver instead of the historical fixed /tmp/zalo-tg
+// directory, which can be left root-owned on Docker bind mounts.
+const TMP_DIR = getSharedTempDir('zalo-tg');
+
+function uniqueTempName(prefix: string, extension: string): string {
+  return createSharedTempPath('zalo-tg', prefix, extension);
+}
 
 /** Keep readable Unicode filenames, but remove path/control chars unsafe on disk. */
 export function sanitizeFileName(fileName: string, fallback = `download_${Date.now()}`): string {
@@ -32,6 +34,9 @@ export function sanitizeFileName(fileName: string, fallback = `download_${Date.n
  *  In that case we copy the file directly instead of downloading via HTTP.
  */
 export async function downloadToTemp(url: string, fileName?: string, retries = 3): Promise<string> {
+  if (!Number.isInteger(retries) || retries < 1) {
+    throw new Error('retries must be an integer >= 1');
+  }
   mkdirSync(TMP_DIR, { recursive: true });
 
   // Local Bot API server returns file:// paths — copy directly, no HTTP needed
@@ -39,9 +44,23 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
     const srcPath = fileURLToPath(url);
     const baseName = sanitizeFileName(fileName ?? path.basename(srcPath));
     const destPath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
-    copyFileSync(srcPath, destPath);
-    // Delete the original from local server's data dir — it's been delivered, no longer needed
-    await unlink(srcPath).catch(() => undefined);
+    try {
+      copyFileSync(srcPath, destPath);
+    } catch (err) {
+      const code = err && typeof err === 'object' && 'code' in err
+        ? String((err as { code?: unknown }).code)
+        : '';
+      if (code === 'ENOENT') {
+        throw new Error(
+          `Local Bot API file is not visible to the bridge: ${srcPath}. `
+          + 'Mount TELEGRAM_WORK_DIR at the same absolute path in both processes.',
+          { cause: err },
+        );
+      }
+      throw err;
+    }
+    // The source belongs to telegram-bot-api's cache. Never delete it here;
+    // cleanTemp() only removes the bridge-owned destination copy.
     return destPath;
   }
 
@@ -62,8 +81,18 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
       console.log(`[media] Downloading: ${url} -> ${filePath}`);
       const resp = await axios.get<NodeJS.ReadableStream>(url, {
         responseType: 'stream',
-        timeout: 30_000,
+        timeout: 15_000, // 15 s per attempt; downloadToTemp retries 3x on failure,
+                         // so total wait is bounded to roughly 15s×3 + backoff
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
+        // Force IPv4-only DNS resolution/connect. Node's Happy Eyeballs
+        // (RFC 8305, default since Node 18) tries IPv6 candidates first; in
+        // many Docker setups the container has no working IPv6 route, so
+        // every request stalls through the full IPv6 connect-attempt timeout
+        // before falling back to IPv4 — surfacing as
+        // `AggregateError [ETIMEDOUT]` at `internalConnectMultiple`. Zalo's
+        // CDN (zdn.vn / dlfl.vn / flchat.vn) is IPv4-only in practice, so
+        // skipping the IPv6 attempt entirely removes this stall.
+        family: 4,
       });
 
       await new Promise<void>((resolve, reject) => {
@@ -94,9 +123,162 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
   throw lastErr;
 }
 
+/**
+ * Download the first working URL in priority order.
+ *
+ * Zalo photo messages can carry an HD URL, a normal URL and a thumbnail. The
+ * CDN does not always keep those variants alive for the same amount of time,
+ * so a dead HD URL must not make the whole message disappear.
+ */
+export async function downloadToTempFromCandidates(
+  urls: readonly string[],
+  fileName?: string,
+  retries = 3,
+): Promise<string> {
+  const candidates = Array.from(new Set(urls.map(url => url.trim()).filter(Boolean)));
+  if (candidates.length === 0) throw new Error('No media URL candidates were provided');
+
+  const errors: unknown[] = [];
+  for (const url of candidates) {
+    try {
+      return await downloadToTemp(url, fileName, retries);
+    } catch (err) {
+      errors.push(err);
+    }
+  }
+
+  throw new AggregateError(errors, `Failed to download media from ${candidates.length} URL candidate(s)`);
+}
+
 /** Remove a temp file, ignoring errors. */
 export async function cleanTemp(filePath: string): Promise<void> {
   try { await unlink(filePath); } catch { /* ignore */ }
+}
+
+/**
+ * Run an array of async tasks with a bounded concurrency limit.
+ *
+ * Firing all tasks at once (Promise.allSettled(tasks.map(...))) saturates the
+ * OS TCP connection pool when the array is large (e.g. an 18-photo album),
+ * causing ETIMEDOUT on later requests even though the server is reachable.
+ *
+ * Returns the same shape as Promise.allSettled so callers can skip
+ * individual failed items without aborting the whole batch.
+ */
+export async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  concurrency = 4,
+): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+  let next = 0;
+
+  async function worker(): Promise<void> {
+    while (next < tasks.length) {
+      const idx = next++;
+      try {
+        results[idx] = { status: 'fulfilled', value: await tasks[idx]!() };
+      } catch (err) {
+        results[idx] = { status: 'rejected', reason: err };
+      }
+    }
+  }
+
+  // Launch `concurrency` parallel workers; each pulls the next task until done
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+  return results;
+}
+
+/** Split Telegram album payloads without ever producing an invalid >10 batch. */
+export function telegramMediaBatches<T>(items: T[], maxBatchSize = 10): T[][] {
+  if (!Number.isInteger(maxBatchSize) || maxBatchSize < 2) {
+    throw new Error('maxBatchSize must be an integer >= 2');
+  }
+  const batches: T[][] = [];
+  for (let i = 0; i < items.length; i += maxBatchSize) {
+    batches.push(items.slice(i, i + maxBatchSize));
+  }
+  return batches;
+}
+
+export interface SpriteSheetLayout {
+  frames: number;
+  frameWidth: number;
+  frameHeight: number;
+  direction: 'horizontal' | 'vertical';
+}
+
+/** Resolve equally sized frames from a Zalo sticker sprite sheet. */
+export function getSpriteSheetLayout(
+  width: number,
+  height: number,
+  declaredFrames = 0,
+): SpriteSheetLayout {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
+    throw new Error('Sprite dimensions must be positive integers');
+  }
+
+  const requested = Number.isInteger(declaredFrames) && declaredFrames > 1
+    ? declaredFrames
+    : 0;
+  if (requested > 1 && width % requested === 0) {
+    return { frames: requested, frameWidth: width / requested, frameHeight: height, direction: 'horizontal' };
+  }
+  if (requested > 1 && height % requested === 0) {
+    return { frames: requested, frameWidth: width, frameHeight: height / requested, direction: 'vertical' };
+  }
+
+  // Zalo currently serves square frames in one horizontal strip. Keep a
+  // vertical inference as a defensive fallback for older sticker packs.
+  if (width > height && width % height === 0) {
+    return { frames: width / height, frameWidth: height, frameHeight: height, direction: 'horizontal' };
+  }
+  if (height > width && height % width === 0) {
+    return { frames: height / width, frameWidth: width, frameHeight: width, direction: 'vertical' };
+  }
+  return { frames: 1, frameWidth: width, frameHeight: height, direction: 'horizontal' };
+}
+
+/** Convert a Zalo PNG/WebP sprite strip into a Telegram-compatible GIF. */
+export async function convertSpriteSheetToGif(
+  inputPath: string,
+  declaredFrames: number,
+  frameDurationMs: number,
+): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const dimensions = await imageSizeFromFile(inputPath);
+  if (!dimensions.width || !dimensions.height) throw new Error('Cannot read sticker sprite dimensions');
+  const layout = getSpriteSheetLayout(dimensions.width, dimensions.height, declaredFrames);
+  if (layout.frames < 2) throw new Error('Sticker sprite does not contain multiple frames');
+
+  const duration = Number.isFinite(frameDurationMs)
+    ? Math.min(1_000, Math.max(20, frameDurationMs))
+    : 100;
+  const frameRate = (1_000 / duration).toFixed(6);
+  const position = layout.direction === 'horizontal'
+    ? `x='mod(n\\,${layout.frames})*${layout.frameWidth}':y=0`
+    : `x=0:y='mod(n\\,${layout.frames})*${layout.frameHeight}'`;
+  const crop = `crop=${layout.frameWidth}:${layout.frameHeight}:${position},format=rgba`;
+  const outputPath = uniqueTempName('zalo_sticker', '.gif');
+
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y',
+      '-loop', '1',
+      '-framerate', frameRate,
+      '-i', inputPath,
+      '-vf', crop,
+      '-frames:v', String(layout.frames),
+      '-loop', '0',
+      outputPath,
+    ]);
+    let stderr = '';
+    ff.stderr?.on('data', chunk => { stderr += String(chunk).slice(-2_000); });
+    ff.on('close', code => code === 0
+      ? resolve()
+      : reject(new Error(`ffmpeg sprite conversion exit ${code}: ${stderr.trim().slice(-500)}`)));
+    ff.on('error', reject);
+  });
+  return outputPath;
 }
 
 /**
@@ -105,7 +287,7 @@ export async function cleanTemp(filePath: string): Promise<void> {
  */
 export async function convertToM4a(inputPath: string): Promise<string> {
   mkdirSync(TMP_DIR, { recursive: true });
-  const outputPath = path.join(TMP_DIR, `voice_${Date.now()}.m4a`);
+  const outputPath = uniqueTempName('voice', '.m4a');
   await new Promise<void>((resolve, reject) => {
     const ff = spawn('ffmpeg', [
       '-y', '-i', inputPath,
@@ -127,29 +309,93 @@ export async function convertToM4a(inputPath: string): Promise<string> {
  */
 export async function convertWebmToGif(inputPath: string): Promise<string> {
   mkdirSync(TMP_DIR, { recursive: true });
-  const outputPath = path.join(TMP_DIR, `sticker_${Date.now()}.gif`);
-  // Two-pass palette for better quality; scale to max 256px wide
-  const palettePass = path.join(TMP_DIR, `palette_${Date.now()}.png`);
-  await new Promise<void>((resolve, reject) => {
-    const ff = spawn('ffmpeg', [
-      '-y', '-i', inputPath,
-      '-vf', 'fps=15,scale=min(256\\,iw):-2:flags=lanczos,palettegen=stats_mode=diff',
-      palettePass,
-    ]);
-    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg palettegen exit ${code}`)));
-    ff.on('error', reject);
-  });
-  await new Promise<void>((resolve, reject) => {
-    const ff = spawn('ffmpeg', [
-      '-y', '-i', inputPath, '-i', palettePass,
-      '-lavfi', 'fps=15,scale=min(256\\,iw):-2:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5',
-      outputPath,
-    ]);
-    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg paletteuse exit ${code}`)));
-    ff.on('error', reject);
-  });
-  await unlink(palettePass).catch(() => undefined);
+  const outputPath = uniqueTempName('sticker', '.gif');
+  // Two-pass palette preserves the original frame rate, Telegram's full
+  // 512px sticker resolution and transparent pixels.
+  const palettePass = uniqueTempName('palette', '.png');
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const ff = spawn('ffmpeg', [
+        '-y', '-i', inputPath,
+        '-vf', 'scale=min(512\\,iw):-2:flags=lanczos,format=rgba,palettegen=stats_mode=diff:reserve_transparent=1',
+        palettePass,
+      ]);
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg palettegen exit ${code}`)));
+      ff.on('error', reject);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const ff = spawn('ffmpeg', [
+        '-y', '-i', inputPath, '-i', palettePass,
+        '-lavfi', 'scale=min(512\\,iw):-2:flags=lanczos,format=rgba[x];[x][1:v]paletteuse=dither=sierra2_4a:alpha_threshold=128',
+        outputPath,
+      ]);
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg paletteuse exit ${code}`)));
+      ff.on('error', reject);
+    });
+  } finally {
+    await unlink(palettePass).catch(() => undefined);
+  }
   return outputPath;
+}
+
+/** Convert a Telegram static WebP sticker to a lossless transparent PNG. */
+export async function convertStickerToPng(inputPath: string): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const { createCanvas, loadImage } = await import('@napi-rs/canvas');
+  const image = await loadImage(inputPath);
+  if (!image.width || !image.height) throw new Error('Cannot read static sticker dimensions');
+  const canvas = createCanvas(image.width, image.height);
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, image.width, image.height);
+  ctx.drawImage(image, 0, 0, image.width, image.height);
+  const outputPath = uniqueTempName('telegram_sticker', '.png');
+  await writeFile(outputPath, canvas.toBuffer('image/png'));
+  return outputPath;
+}
+
+/** Render Telegram's gzip-compressed Lottie/TGS sticker to a transparent GIF. */
+export async function convertTgsToGif(inputPath: string): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const compressed = await readFile(inputPath);
+  let animationData: Buffer;
+  try {
+    animationData = gunzipSync(compressed);
+  } catch {
+    // Accept plain Lottie JSON too, which makes the converter easier to test
+    // and supports clients that already decompressed the TGS payload.
+    animationData = compressed;
+  }
+
+  const { createCanvas, GifDisposal, GifEncoder, LottieAnimation } = await import('@napi-rs/canvas');
+  const animation = LottieAnimation.loadFromData(animationData);
+  const width = Math.round(animation.width);
+  const height = Math.round(animation.height);
+  const frameCount = Math.max(1, Math.round(animation.frames));
+  const fps = Number.isFinite(animation.fps) && animation.fps > 0 ? animation.fps : 30;
+  if (width < 1 || height < 1) throw new Error('TGS animation has invalid dimensions');
+  if (frameCount > 600) throw new Error(`TGS animation has too many frames: ${frameCount}`);
+
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  const encoder = new GifEncoder(width, height, { repeat: 0, quality: 5 });
+  const delay = Math.max(20, Math.round(1_000 / fps));
+  try {
+    for (let frame = 0; frame < frameCount; frame++) {
+      ctx.clearRect(0, 0, width, height);
+      animation.seekFrame(frame);
+      animation.render(ctx);
+      const rgba = ctx.getImageData(0, 0, width, height).data;
+      encoder.addFrame(new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength), width, height, {
+        delay,
+        disposal: GifDisposal.Background,
+      });
+    }
+    const outputPath = uniqueTempName('telegram_sticker', '.gif');
+    await writeFile(outputPath, encoder.finish());
+    return outputPath;
+  } finally {
+    encoder.dispose();
+  }
 }
 
 /**
@@ -158,7 +404,7 @@ export async function convertWebmToGif(inputPath: string): Promise<string> {
  */
 export async function extractVideoThumbnail(videoPath: string): Promise<string> {
   mkdirSync(TMP_DIR, { recursive: true });
-  const outputPath = path.join(TMP_DIR, `thumb_${Date.now()}.jpg`);
+  const outputPath = uniqueTempName('thumb', '.jpg');
   await new Promise<void>((resolve, reject) => {
     const ff = spawn('ffmpeg', [
       '-y', '-i', videoPath,
@@ -179,10 +425,13 @@ const VIDEO_EXTS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv']);
 /** Guess media type from filename or URL. */
 export function detectMediaType(fileNameOrUrl: string): 'image' | 'video' | 'document' {
   const lower = fileNameOrUrl.toLowerCase();
-  const ext   = path.extname(lower.split('?')[0] ?? '');
+  // Query strings and fragments are URL metadata, not part of the filename.
+  // Strip both before asking path.extname() so `clip.webm#t=3` is detected.
+  const pathname = lower.split(/[?#]/, 1)[0] ?? '';
+  const ext = path.extname(pathname);
   if (IMAGE_EXTS.has(ext)) return 'image';
   if (VIDEO_EXTS.has(ext)) return 'video';
-  if (/\.(jpg|jpeg|png|gif|webp)(\?|$)/.test(lower)) return 'image';
-  if (/\.(mp4|mov|avi|mkv|webm)(\?|$)/.test(lower))  return 'video';
+  if (/\.(jpg|jpeg|png|gif|webp)(?:[?#]|$)/.test(lower)) return 'image';
+  if (/\.(mp4|mov|avi|mkv|webm)(?:[?#]|$)/.test(lower))  return 'video';
   return 'document';
 }

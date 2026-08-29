@@ -12,7 +12,7 @@
         var: git_out.stdout_lines
 
     - name: 2. Build Source (and Install dependencies if needed)
-      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && npx pnpm run build"'
+      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && CI=true npx pnpm run build"'
       register: build_out
 
     - name: Show Build Output

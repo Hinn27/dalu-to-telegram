@@ -3,10 +3,26 @@
   hosts: dc
   gather_facts: no
   tasks:
-    - name: Pull latest code, build, and restart service
-      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && git remote set-url origin https://github.com/Hinn27/dalu-to-telegram.git && git fetch origin && git reset --hard origin/main && npx pnpm run build && /usr/bin/sv restart zalo-tg"'
-      register: deploy_out
+    - name: 1. Fetch and Reset Git Repository
+      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && git fetch origin && git reset --hard origin/main"'
+      register: git_out
 
-    - name: Show output
+    - name: Show Git Output
       debug:
-        var: deploy_out.stdout_lines
+        var: git_out.stdout_lines
+
+    - name: 2. Build Source (and Install dependencies if needed)
+      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && npx pnpm run build"'
+      register: build_out
+
+    - name: Show Build Output
+      debug:
+        var: build_out.stdout_lines
+
+    - name: 3. Restart Service
+      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && /usr/bin/sv restart zalo-tg"'
+      register: restart_out
+
+    - name: Show Restart Output
+      debug:
+        var: restart_out.stdout_lines

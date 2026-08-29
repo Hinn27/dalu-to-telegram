@@ -1,0 +1,12 @@
+---
+- name: Deploy dalu-to-telegram to DC
+  hosts: dc
+  gather_facts: no
+  tasks:
+    - name: Pull latest code, build, and restart service
+      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && git remote set-url origin https://github.com/Hinn27/dalu-to-telegram.git && git reset --hard && git pull origin main && npx pnpm run build && /usr/bin/sv restart zalo-tg"'
+      register: deploy_out
+
+    - name: Show output
+      debug:
+        var: deploy_out.stdout_lines

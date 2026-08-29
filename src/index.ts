@@ -4,7 +4,8 @@ import { setupZaloHandler } from './zalo/handler.js';
 import { tgBot, syncTelegramCommands } from './telegram/bot.js';
 import { setupTelegramHandler } from './telegram/handler.js';
 import { config } from './config.js';
-import { startUpdateChecker } from './updater.js';
+import { readdirSync, statSync, unlinkSync } from 'fs';
+import path from 'path';
 import { store, userCache } from './store.js';
 import { registerShutdownHandler, requestShutdown } from './lifecycle.js';
 import { terminal } from './utils/terminal.js';
@@ -140,10 +141,24 @@ async function main(): Promise<void> {
   terminal.status('runtime', `${process.version} · pid ${process.pid}`, 'muted');
   terminal.status('cache', `${userCache.stats().users} users · ${store.all().length} topics restored`, 'muted');
 
-  // ── Auto update checker — must register BEFORE setupTelegramHandler ─────────
-  // bot.action() is middleware; the catch-all on('callback_query') in handler.ts
-  // doesn't call next(), so ua: callbacks must be registered first in the chain.
-  startUpdateChecker(tgBot);
+  // ── Periodic temp file cleanup — remove stale files older than 1 hour ───────
+  const TEMP_MAX_AGE_MS = 60 * 60 * 1000;
+  const { getSharedTempDir } = await import('./utils/sharedTemp.js');
+  setInterval(() => {
+    try {
+      const tmpDir = getSharedTempDir('zalo-tg');
+      const now = Date.now();
+      for (const f of readdirSync(tmpDir)) {
+        const fp = path.join(tmpDir, f);
+        try {
+          const s = statSync(fp);
+          if (s.isFile() && now - s.mtimeMs > TEMP_MAX_AGE_MS) {
+            unlinkSync(fp);
+          }
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+  }, 30 * 60 * 1000);
 
   // ── Wire up Telegram handler BEFORE launching the bot ─────────────────────
   // setupTelegramHandler returns a setter to inject the Zalo API after auto-login.
@@ -173,7 +188,6 @@ async function main(): Promise<void> {
     { command: 'status',         description: 'Xem trạng thái bridge: uptime, số topic, Zalo' },
     { command: 'restart',        description: 'Khởi động lại bridge (chỉ admin)' },
     { command: 'setup',          description: 'Cấu hình biến env qua wizard (chỉ admin)' },
-    { command: 'update',         description: 'Kiểm tra bản cập nhật mới' },
   ]).catch(() => undefined);
 
   // ── Graceful shutdown/restart shared by signals, commands and polling ──────

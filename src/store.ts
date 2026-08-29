@@ -22,7 +22,7 @@ export function markRecalled(msgId: string): void {
  * "🗑 đã thu hồi" notice is sent again (issue #65). A Zalo message can only
  * be recalled once, so entries never expire; the set is bounded FIFO.
  */
-const RECALL_NOTIFIED_MAX = 20_000;
+const RECALL_NOTIFIED_MAX = 5_000;
 const _recallNotifiedMsgIds = new Set<string>();
 export const recallNotifiedStore = {
   /** Returns true (and marks) if this recall was NOT notified before. */
@@ -181,7 +181,7 @@ export interface ZaloQuoteData {
   threadType: 0 | 1;
 }
 
-const MSG_CACHE_MAX = 10000;
+const MSG_CACHE_MAX = 5000;
 
 // ── Persistence helpers for msgStore ─────────────────────────────────────────
 //
@@ -975,8 +975,8 @@ export const reactionEchoStore = {
 };
 
 const REACTION_EVENT_DEDUPE_TTL_MS = 15_000;
-const REACTION_EVENT_DEDUPE_MAX = 20_000;
-const REACTION_ACTION_MAX = 50_000;
+const REACTION_EVENT_DEDUPE_MAX = 5_000;
+const REACTION_ACTION_MAX = 10_000;
 const _recentReactionEvents = new Map<string, number>();
 const _seenReactionActions = new Set<string>();
 

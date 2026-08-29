@@ -41,7 +41,12 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
 
   // Local Bot API server returns file:// paths — copy directly, no HTTP needed
   if (url.startsWith('file:')) {
-    let srcPath; try { srcPath = fileURLToPath(url); } catch(e) { srcPath = decodeURIComponent(url.replace(/^file:\/\/(localhost)?/, '')); if(!srcPath.startsWith('/')) srcPath = '/' + srcPath; } console.log('[DEBUG] url:', url, '->', srcPath);
+    let srcPath: string;
+    try {
+      srcPath = fileURLToPath(url);
+    } catch (err) {
+      srcPath = decodeURIComponent(new URL(url).pathname);
+    }
     const baseName = sanitizeFileName(fileName ?? path.basename(srcPath));
     const destPath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
     try {

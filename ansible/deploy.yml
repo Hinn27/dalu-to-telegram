@@ -1,28 +1,69 @@
 ---
-- name: Deploy dalu-to-telegram to DC
+- name: Cài đặt và Triển khai dalu-to-telegram Server
   hosts: dc
   gather_facts: no
   tasks:
-    - name: 1. Fetch and Reset Git Repository
-      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && git fetch origin && git reset --hard origin/main"'
-      register: git_out
+    - name: 1. Cài đặt các gói hệ thống cần thiết (Git, Nodejs, Runit, ffmpeg...)
+      ansible.builtin.apt:
+        name:
+          - git
+          - nodejs
+          - npm
+          - ffmpeg
+          - procps
+          - curl
+          - rsync
+        state: present
+        update_cache: yes
 
-    - name: Show Git Output
-      debug:
-        var: git_out.stdout_lines
+    - name: 2. Cài đặt công cụ pnpm và pm2
+      ansible.builtin.npm:
+        name: "{{ item }}"
+        global: yes
+        state: present
+      loop:
+        - pnpm@9
+        - pm2
 
-    - name: 2. Build Source (and Install dependencies if needed)
-      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && cd /root/dalu-to-telegram && CI=true npx pnpm run build"'
-      register: build_out
+    - name: 3. Tạo thư mục chứa Code trên Server
+      ansible.builtin.file:
+        path: /root/dalu-to-telegram
+        state: directory
+        mode: '0755'
 
-    - name: Show Build Output
-      debug:
-        var: build_out.stdout_lines
+    - name: 4. Copy toàn bộ Code từ Laptop sang Server (Bỏ qua file rác)
+      ansible.posix.synchronize:
+        src: /home/hinne/Documents/Code/project-vui-vui/dalu-to-telegram/
+        dest: /root/dalu-to-telegram/
+        delete: yes
+        rsync_opts:
+          - "--exclude=node_modules"
+          - "--exclude=dist"
+          - "--exclude=.git"
+          - "--exclude=ansible"
 
-    - name: 3. Restart Service
-      command: su -c 'chroot /data/local/debian /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin && /usr/bin/sv restart zalo-tg"'
-      register: restart_out
+    - name: 5. Phục hồi Dữ liệu phiên Zalo cũ (từ thư mục dalu-occac)
+      ansible.posix.synchronize:
+        src: /home/hinne/dalu-occac/
+        dest: /root/dalu-to-telegram/
 
-    - name: Show Restart Output
-      debug:
-        var: restart_out.stdout_lines
+    - name: 6. Cài đặt các thư viện Node.js (pnpm install)
+      ansible.builtin.command: pnpm install --prod=false
+      args:
+        chdir: /root/dalu-to-telegram
+      environment:
+        CI: "true"
+
+    - name: 7. Build mã nguồn (pnpm build)
+      ansible.builtin.command: pnpm run build
+      args:
+        chdir: /root/dalu-to-telegram
+      environment:
+        CI: "true"
+
+    - name: 8. Khởi động / Khởi động lại Bot bằng PM2
+      ansible.builtin.shell: |
+        pm2 restart zalo-tg || pm2 start dist/index.js --name "zalo-tg" --max-memory-restart 256M --env NODE_ENV=production
+        pm2 save
+      args:
+        chdir: /root/dalu-to-telegram

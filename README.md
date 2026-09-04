@@ -390,3 +390,32 @@ npm run check
 ```
 
 The test suite covers formatting, config validation, stores, media conversion/download helpers, reaction mapping, queue behavior and regressions around Zalo/Telegram edge cases.
+
+## 🚀 Automated Deployment with Ansible & PM2
+
+This project includes an **Ansible** playbook to automate the deployment to a raw Linux server (VPS, Debian, Termux Chroot, etc.) from scratch. It uses **PM2** as the process manager.
+
+### Step 1: Server Preparation
+Ensure your server (or Debian Chroot environment) has an SSH server running and you have `root` access.
+
+### Step 2: Local Configuration
+1. Edit `ansible/inventory.ini` and update the server's IP address (e.g., Tailscale IP).
+2. Fill in the `.env` file in the root directory (especially `TG_API_ID` and `TG_API_HASH` from `my.telegram.org`).
+
+### Step 3: Run Deployment
+On your local machine, navigate to the project directory and run:
+```bash
+cd ansible
+ansible-playbook -i inventory.ini deploy.yml
+```
+Ansible will automatically:
+- Install system dependencies (Node.js, Git, rsync, FFmpeg, PM2).
+- Synchronize source code, `.env`, and existing Cache data to the server.
+- Compile the C++ **Telegram Local Bot API** server (listening on port 8081).
+- Start both the API Server and the Bot using PM2.
+
+### Step 4: Manage the Bot via PM2
+Connect to your server via SSH and use PM2 commands:
+- `pm2 ls`: List all running processes.
+- `pm2 logs zalo-tg`: View live bot logs.
+- `pm2 restart zalo-tg`: Restart the bot after modifying `.env`.

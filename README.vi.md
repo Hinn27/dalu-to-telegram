@@ -388,3 +388,32 @@ npm run check
 ```
 
 Test suite đang cover format, config validation, store, media conversion/download helper, reaction mapping, queue behavior và các regression quanh edge case Zalo/Telegram.
+
+## 🚀 Triển khai (Deployment) tự động bằng Ansible & PM2
+
+Dự án này tích hợp sẵn bộ cấu hình **Ansible** để tự động hóa việc cài đặt lên máy chủ Linux (VPS, Debian, Termux Chroot, v.v.) từ con số 0. Hệ thống sử dụng **PM2** để quản lý tiến trình chạy ngầm.
+
+### Bước 1: Chuẩn bị trên máy chủ (Server)
+Đảm bảo máy chủ (hoặc môi trường Debian Chroot) đã được cài đặt SSH và bạn có quyền truy cập `root`.
+
+### Bước 2: Cấu hình trên máy cá nhân (Local)
+1. Mở file `ansible/inventory.ini`, sửa lại địa chỉ IP của máy chủ (ví dụ IP của Tailscale).
+2. Điền đầy đủ thông tin vào file `.env` tại thư mục gốc (quan trọng nhất là `TG_API_ID` và `TG_API_HASH` lấy từ `my.telegram.org`).
+
+### Bước 3: Chạy lệnh Deploy
+Trên máy cá nhân, di chuyển vào thư mục dự án và chạy:
+```bash
+cd ansible
+ansible-playbook -i inventory.ini deploy.yml
+```
+Ansible sẽ tự động:
+- Cài đặt Node.js, Git, rsync, FFmpeg, PM2, và các thư viện cần thiết.
+- Đồng bộ mã nguồn, cấu hình, và dữ liệu Cache cũ sang Server.
+- Tự động Build mã nguồn C++ cho **Telegram Local Bot API** (chạy ở cổng 8081).
+- Khởi động cả API Server và Bot bằng PM2.
+
+### Bước 4: Quản lý Bot bằng PM2 trên Server
+Kết nối SSH vào máy chủ và sử dụng các lệnh:
+- `pm2 ls`: Xem danh sách tiến trình.
+- `pm2 logs zalo-tg`: Xem log trực tiếp của Bot.
+- `pm2 restart zalo-tg`: Khởi động lại Bot sau khi đổi `.env`.
